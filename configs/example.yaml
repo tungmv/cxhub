@@ -1,0 +1,56 @@
+gateway:
+  host: 127.0.0.1
+  port: 8787
+  request_timeout: 10m
+
+backends:
+  cliproxy:
+    type: openai-compatible
+    base_url: http://127.0.0.1:8317/v1
+    api_key: ${CLIPROXY_API_KEY}
+    requires_api_key: false
+  openrouter:
+    type: openai-compatible
+    base_url: https://openrouter.ai/api/v1
+    api_key: ${OPENROUTER_API_KEY}
+    requires_api_key: true
+    headers:
+      HTTP-Referer: http://127.0.0.1:8787
+      X-Title: cxhub
+  ckey:
+    type: openai-compatible
+    # Verify the ckey.vn URL, auth requirements, and models before use.
+    base_url: https://REPLACE-WITH-VERIFIED-CKEY-ENDPOINT/v1
+    api_key: ${CKEY_API_KEY}
+    requires_api_key: true
+
+profiles:
+  orchestrator:
+    targets:
+      - backend: cliproxy
+        model: YOUR_MODEL
+  researcher:
+    targets:
+      - backend: openrouter
+        model: YOUR_MODEL
+      - backend: cliproxy
+        model: YOUR_MODEL
+  coder:
+    targets:
+      - backend: cliproxy
+        model: YOUR_MODEL
+      - backend: openrouter
+        model: YOUR_MODEL
+  reviewer:
+    targets:
+      - backend: ckey
+        model: YOUR_MODEL
+      - backend: openrouter
+        model: YOUR_MODEL
+  fast:
+    targets:
+      - backend: openrouter
+        model: YOUR_MODEL
+
+logging:
+  verbose: false

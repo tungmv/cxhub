@@ -1,0 +1,14 @@
+# Local builds
+/cxhub
+*.test
+
+# Local configuration and secrets
+config.yaml
+configs/*.local.yaml
+*.env
+.env.*
+
+# OS/editor files
+.DS_Store
+.idea/
+.vscode/

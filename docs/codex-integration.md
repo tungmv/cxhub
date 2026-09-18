@@ -160,10 +160,9 @@ intended `--model`/profile override.
 
 ## Compatibility limitations and assumptions
 
-- The initial provider implementation assumes CLIProxyAPI, OpenRouter, and ckey.vn
-  expose a compatible Responses endpoint. Provider-specific differences must be
-  handled by configuration or a later explicit adapter; ckey.vn URL/model values
-  remain placeholders until verified.
+- The initial provider implementation assumes CLIProxyAPI and OpenRouter expose a
+  compatible Responses endpoint. Provider-specific differences must be handled by
+  configuration or a later explicit adapter.
 - Codex may send fields newer than this gateway understands. Unknown JSON is retained
   when forwarding; the gateway only interprets `model`, `stream`, and a small amount
   of request metadata for routing and observability.

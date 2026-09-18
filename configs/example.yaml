@@ -17,13 +17,6 @@ backends:
     headers:
       HTTP-Referer: http://127.0.0.1:8787
       X-Title: cxhub
-  ckey:
-    type: openai-compatible
-    # Verify the ckey.vn URL, auth requirements, and models before use.
-    base_url: https://REPLACE-WITH-VERIFIED-CKEY-ENDPOINT/v1
-    api_key: ${CKEY_API_KEY}
-    requires_api_key: true
-
 profiles:
   orchestrator:
     targets:
@@ -43,8 +36,6 @@ profiles:
         model: YOUR_MODEL
   reviewer:
     targets:
-      - backend: ckey
-        model: YOUR_MODEL
       - backend: openrouter
         model: YOUR_MODEL
   fast:

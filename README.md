@@ -25,8 +25,7 @@ export OPENROUTER_API_KEY=...
 ```
 
 API keys are expanded from `${ENV_NAME}` at load time and are never sent to Codex
-or written to logs. Keep the ckey.vn URL, authentication, and model IDs as verified
-local values; this repository intentionally does not guess them.
+or written to logs. Keep authentication and model IDs as verified local values.
 
 Validate and run:
 
@@ -69,7 +68,7 @@ typical configuration can route:
 orchestrator -> cliproxy / model-A
 researcher   -> openrouter / model-B
 coder        -> cliproxy / model-C
-reviewer     -> ckey / model-D
+reviewer     -> openrouter / model-D
 fast         -> openrouter / model-E
 ```
 
@@ -105,7 +104,6 @@ go vet ./...
 
 CLIProxyAPI and OpenRouter are represented as generic OpenAI-compatible backends.
 The current local Codex inspection found CLIProxyAPI at `http://127.0.0.1:8317/v1`
-and OpenRouter at `https://openrouter.ai/api/v1`. ckey.vn remains a placeholder until
-its endpoint and authentication contract are verified. If a backend differs from the
+and OpenRouter at `https://openrouter.ai/api/v1`. If a backend differs from the
 Responses API, add an explicit provider adapter rather than silently changing event
 semantics.

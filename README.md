@@ -66,7 +66,6 @@ typical configuration can route:
 
 ```text
 orchestrator -> cliproxy / model-A
-researcher   -> openrouter / model-B
 coder        -> cliproxy / model-C
 reviewer     -> openrouter / model-D
 fast         -> openrouter / model-E

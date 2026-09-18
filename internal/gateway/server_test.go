@@ -105,10 +105,10 @@ func TestConcurrentFanoutIsolation(t *testing.T) {
 		"c": {delay: 15 * time.Millisecond, events: []string{event("response.output_text.delta", `{"delta":"c"}`), "data: [DONE]\n\n"}},
 	}
 	profiles := map[string]config.ProfileConfig{
-		"researcher": {Targets: []config.TargetConfig{{Backend: "b", Model: "model-research"}}},
-		"coder":      {Targets: []config.TargetConfig{{Backend: "a", Model: "model-code"}}},
-		"reviewer":   {Targets: []config.TargetConfig{{Backend: "c", Model: "model-review"}}},
-		"fast":       {Targets: []config.TargetConfig{{Backend: "b", Model: "model-fast"}}},
+		"orchestrator": {Targets: []config.TargetConfig{{Backend: "b", Model: "model-orchestrator"}}},
+		"coder":        {Targets: []config.TargetConfig{{Backend: "a", Model: "model-code"}}},
+		"reviewer":     {Targets: []config.TargetConfig{{Backend: "c", Model: "model-review"}}},
+		"fast":         {Targets: []config.TargetConfig{{Backend: "b", Model: "model-fast"}}},
 	}
 	server, _ := newTestGateway(t, backends, profiles)
 
@@ -150,7 +150,7 @@ func TestConcurrentFanoutIsolation(t *testing.T) {
 		requests := append([]fakeRequest(nil), fake.requests...)
 		fake.mu.Unlock()
 		for _, request := range requests {
-			if name == "a" && request.Model != "model-code" || name == "b" && request.Model != "model-research" && request.Model != "model-fast" || name == "c" && request.Model != "model-review" {
+			if name == "a" && request.Model != "model-code" || name == "b" && request.Model != "model-orchestrator" && request.Model != "model-fast" || name == "c" && request.Model != "model-review" {
 				t.Fatalf("backend %s received wrong model %s", name, request.Model)
 			}
 		}
@@ -197,8 +197,8 @@ func TestNonStreamingResponse(t *testing.T) {
 func TestFallbackBeforeGeneration(t *testing.T) {
 	first := &fakeUpstream{status: http.StatusBadGateway}
 	second := &fakeUpstream{events: []string{event("response.output_text.delta", `{"delta":"ok"}`), "data: [DONE]\n\n"}}
-	server, _ := newTestGateway(t, map[string]*fakeUpstream{"first": first, "second": second}, map[string]config.ProfileConfig{"researcher": {Targets: []config.TargetConfig{{Backend: "first", Model: "one"}, {Backend: "second", Model: "two"}}}})
-	response, err := server.Client().Post(server.URL+"/v1/responses", "application/json", strings.NewReader(`{"model":"researcher","stream":true}`))
+	server, _ := newTestGateway(t, map[string]*fakeUpstream{"first": first, "second": second}, map[string]config.ProfileConfig{"fallback": {Targets: []config.TargetConfig{{Backend: "first", Model: "one"}, {Backend: "second", Model: "two"}}}})
+	response, err := server.Client().Post(server.URL+"/v1/responses", "application/json", strings.NewReader(`{"model":"fallback","stream":true}`))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -212,8 +212,8 @@ func TestFallbackBeforeGeneration(t *testing.T) {
 func TestFallbackWhenStreamEndsBeforeFirstEvent(t *testing.T) {
 	first := &fakeUpstream{events: nil}
 	second := &fakeUpstream{events: []string{event("response.output_text.delta", `{"delta":"recovered"}`), "data: [DONE]\n\n"}}
-	server, _ := newTestGateway(t, map[string]*fakeUpstream{"first": first, "second": second}, map[string]config.ProfileConfig{"researcher": {Targets: []config.TargetConfig{{Backend: "first", Model: "one"}, {Backend: "second", Model: "two"}}}})
-	response, err := server.Client().Post(server.URL+"/v1/responses", "application/json", strings.NewReader(`{"model":"researcher","stream":true}`))
+	server, _ := newTestGateway(t, map[string]*fakeUpstream{"first": first, "second": second}, map[string]config.ProfileConfig{"fallback": {Targets: []config.TargetConfig{{Backend: "first", Model: "one"}, {Backend: "second", Model: "two"}}}})
+	response, err := server.Client().Post(server.URL+"/v1/responses", "application/json", strings.NewReader(`{"model":"fallback","stream":true}`))
 	if err != nil {
 		t.Fatal(err)
 	}

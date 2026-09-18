@@ -3,10 +3,10 @@
 The request's `model` is the logical profile name. For example:
 
 ```json
-{"model":"researcher","stream":true,"input":[]}
+{"model":"coder","stream":true,"input":[]}
 ```
 
-`researcher` is looked up in `profiles`, then its targets are attempted in listed
+`coder` is looked up in `profiles`, then its targets are attempted in listed
 order. Each target contains a backend ID and the real model ID. The real model is
 never advertised through `/v1/models`.
 

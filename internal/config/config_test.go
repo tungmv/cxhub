@@ -5,7 +5,7 @@ import "testing"
 func TestValidateRejectsBadTarget(t *testing.T) {
 	cfg := &Config{
 		Backends: map[string]BackendConfig{"one": {Type: "openai-compatible", BaseURL: "http://127.0.0.1:1/v1"}},
-		Profiles: map[string]ProfileConfig{"researcher": {Targets: []TargetConfig{{Backend: "missing", Model: "m"}}}},
+		Profiles: map[string]ProfileConfig{"bad-profile": {Targets: []TargetConfig{{Backend: "missing", Model: "m"}}}},
 	}
 	if err := cfg.Validate(); err == nil {
 		t.Fatal("expected missing backend error")
@@ -15,7 +15,7 @@ func TestValidateRejectsBadTarget(t *testing.T) {
 func TestValidateRejectsDuplicateTarget(t *testing.T) {
 	cfg := &Config{
 		Backends: map[string]BackendConfig{"one": {Type: "openai-compatible", BaseURL: "http://127.0.0.1:1/v1"}},
-		Profiles: map[string]ProfileConfig{"researcher": {Targets: []TargetConfig{{Backend: "one", Model: "m"}, {Backend: "one", Model: "m"}}}},
+		Profiles: map[string]ProfileConfig{"duplicate-profile": {Targets: []TargetConfig{{Backend: "one", Model: "m"}, {Backend: "one", Model: "m"}}}},
 	}
 	if err := cfg.Validate(); err == nil {
 		t.Fatal("expected duplicate target error")

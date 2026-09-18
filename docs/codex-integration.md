@@ -74,7 +74,7 @@ there is no implicit profile fallback because that could route a child to the wr
 provider.
 
 ```json
-{"model":"researcher","stream":true,"input":[]}
+{"model":"coder","stream":true,"input":[]}
 ```
 
 The gateway resolves `model` as a configured logical profile. If the request omits
@@ -150,8 +150,8 @@ intended `--model`/profile override.
 
 1. Configure one Codex provider whose `base_url` is `http://127.0.0.1:8787/v1` and
    whose `wire_api` is `responses`.
-2. Use a minimal logical model roster such as `orchestrator`, `researcher`,
-   `coder`, `reviewer`, and `fast`.
+2. Use a minimal logical model roster such as `orchestrator`, `coder`,
+   `reviewer`, and `fast`.
 3. Resolve each request's model to a profile and then to a deterministic target
    chain in `cxhub` configuration.
 4. Forward the original Responses request and stream provider events back to Codex.

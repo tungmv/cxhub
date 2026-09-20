@@ -97,7 +97,7 @@ func (c *Config) Validate() error {
 		if strings.TrimSpace(name) == "" {
 			return fmt.Errorf("backend name must not be empty")
 		}
-		if b.Type != "openai-compatible" {
+		if b.Type != "openai-compatible" && b.Type != "openai-chat-compatible" {
 			return fmt.Errorf("backend %q has unsupported type %q", name, b.Type)
 		}
 		u, err := url.Parse(b.BaseURL)

@@ -103,6 +103,8 @@ go vet ./...
 
 CLIProxyAPI and OpenRouter are represented as generic OpenAI-compatible backends.
 The current local Codex inspection found CLIProxyAPI at `http://127.0.0.1:8317/v1`
-and OpenRouter at `https://openrouter.ai/api/v1`. If a backend differs from the
-Responses API, add an explicit provider adapter rather than silently changing event
-semantics.
+and OpenRouter at `https://openrouter.ai/api/v1`. NVIDIA's
+`https://integrate.api.nvidia.com/v1` endpoint is configured with
+`type: openai-chat-compatible`; cxhub translates its Chat Completions requests and
+streams back Responses events. If another backend differs from the Responses API,
+add an explicit provider adapter rather than silently changing event semantics.

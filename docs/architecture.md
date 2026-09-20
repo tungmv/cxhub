@@ -19,10 +19,12 @@ own logical profile, resolves a private target slice, creates an upstream reques
 with the incoming context, and streams only that request's events to its client.
 There is no current-model, current-profile, or active-provider global.
 
-The provider implementation is deliberately small: it sends the original JSON
-Responses request with only `model` replaced by the target's real model, injects the
-configured backend key/headers, and returns the upstream HTTP response. SSE parsing
-is done per request so event order and cancellation remain local to that request.
+The provider implementation is deliberately small: Responses-compatible backends
+receive the original JSON request with only `model` replaced by the target's real
+model. Chat-compatible backends, such as NVIDIA's hosted endpoint, translate the
+request to Chat Completions and translate text/tool streaming back to Responses.
+Both variants inject the configured backend key/headers. SSE parsing is done per
+request so event order and cancellation remain local to that request.
 
 Endpoints:
 

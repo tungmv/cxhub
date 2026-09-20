@@ -17,6 +17,16 @@ backends:
     headers:
       HTTP-Referer: http://127.0.0.1:8787
       X-Title: cxhub
+  nvidia:
+    type: openai-chat-compatible
+    base_url: ${NVIDIA_BASE_URL}
+    api_key: ${NVIDIA_API_KEY}
+    requires_api_key: true
+  nvidia-2:
+    type: openai-chat-compatible
+    base_url: ${NVIDIA_BASE_URL_2}
+    api_key: ${NVIDIA_API_KEY_2}
+    requires_api_key: true
 profiles:
   orchestrator:
     targets:
@@ -36,6 +46,12 @@ profiles:
     targets:
       - backend: openrouter
         model: YOUR_MODEL
+  nvidia/deepseek-ai/deepseek-v4-flash-0731:
+    targets:
+      - backend: nvidia
+        model: deepseek-ai/deepseek-v4-flash-0731
+      - backend: nvidia-2
+        model: deepseek-ai/deepseek-v4-flash-0731
 
 logging:
   verbose: false

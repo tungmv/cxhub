@@ -126,7 +126,12 @@ func startCommand(args []string) error {
 	logger := slog.New(slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: level}))
 	providers := make(map[string]provider.Provider, len(cfg.Backends))
 	for name, backend := range cfg.Backends {
-		providers[name] = provider.NewOpenAICompatible(name, backend, provider.DefaultHTTPClient(cfg.RequestTimeoutDuration()))
+		client := provider.DefaultHTTPClient(cfg.RequestTimeoutDuration())
+		if backend.Type == "openai-chat-compatible" {
+			providers[name] = provider.NewOpenAIChatCompatible(name, backend, client)
+		} else {
+			providers[name] = provider.NewOpenAICompatible(name, backend, client)
+		}
 	}
 	server := gateway.NewServer(cfg, providers, logger)
 	pidLock, err := writePID(*pidFile)
@@ -226,17 +231,23 @@ func doctorCommand(args []string) error {
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	if missing := config.MissingEnvironmentReferences(*path); len(missing) > 0 {
-		fmt.Printf("missing environment variables: %v\n", missing)
-	}
 	cfg, err := config.Load(*path)
 	if err != nil {
 		return err
 	}
+	if missing := config.MissingEnvironmentReferences(*path); len(missing) > 0 {
+		fmt.Printf("missing environment variables: %v\n", missing)
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	for name, backend := range cfg.Backends {
-		p := provider.NewOpenAICompatible(name, backend, provider.DefaultHTTPClient(5*time.Second))
+		var p provider.Provider
+		client := provider.DefaultHTTPClient(5 * time.Second)
+		if backend.Type == "openai-chat-compatible" {
+			p = provider.NewOpenAIChatCompatible(name, backend, client)
+		} else {
+			p = provider.NewOpenAICompatible(name, backend, client)
+		}
 		if err := p.Health(ctx); err != nil {
 			fmt.Printf("backend %s: unhealthy (%v)\n", name, err)
 		} else {

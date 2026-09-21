@@ -46,6 +46,7 @@ file, preserving unrelated settings:
 ```toml
 model_provider = "cxhub"
 model = "orchestrator"
+model_catalog_json = "~/.codex/model_catalog.json"
 
 [model_providers.cxhub]
 name = "cxhub"
@@ -55,9 +56,33 @@ requires_openai_auth = false
 supports_websockets = false
 ```
 
+Codex requires metadata for logical profiles that are not in its built-in
+catalog. Copy `configs/codex-model-catalog.json` to
+`~/.codex/model_catalog.json`; its `orchestrator` entry defines the context
+window and supported reasoning levels used by the local profile.
+
 `cxhub init` only creates its own YAML example and deliberately does not rewrite the
 existing Codex TOML automatically. The installed Codex CLI was inspected in
 [docs/codex-integration.md](/Users/tony/build/cxhub/docs/codex-integration.md).
+
+## Claude Code setup
+
+cxhub also exposes the Anthropic Messages wire format on the same listener, so
+Claude Code can use the same logical profiles and fallback pipeline:
+
+```sh
+export ANTHROPIC_BASE_URL=http://127.0.0.1:8787
+export ANTHROPIC_AUTH_TOKEN=not-needed  # any value; cxhub does not gate inbound auth
+claude
+```
+
+Or persist it with a launcher alias/wrapper so it only applies where wanted.
+`POST /v1/messages` accepts Anthropic Messages requests, maps the `model` field
+to a cxhub profile (text, images, `tool_use`/`tool_result` blocks, and tools are
+translated to Responses equivalents), and streams back Anthropic SSE events.
+`POST /v1/messages/count_tokens` is answered with a local estimate without
+spending upstream tokens. Under the hood both Codex and Claude Code share the
+identical target resolution, fallback, retry, and timeout pipeline.
 
 ## Profiles and fanout
 
@@ -72,7 +97,13 @@ fast         -> openrouter / model-E
 ```
 
 Each request is isolated, so concurrent child agents cannot change one another's
-provider or model. See [docs/routing.md](/Users/tony/build/cxhub/docs/routing.md) and
+provider or model. Profiles can declare a `level` so that when every target of
+the requested profile fails or times out, other profiles at the same level serve
+the request (ordered by `priority`); each target can also set a `timeout` that
+triggers fallback when an upstream stalls before producing output, and a profile
+can declare `retries`/`retry_backoff` to make a critical profile such as the
+orchestrator practically never fail. See
+[docs/routing.md](/Users/tony/build/cxhub/docs/routing.md) and
 [docs/architecture.md](/Users/tony/build/cxhub/docs/architecture.md).
 
 ## Operations

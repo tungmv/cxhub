@@ -28,30 +28,46 @@ backends:
     api_key: ${NVIDIA_API_KEY_2}
     requires_api_key: true
 profiles:
+  # Profiles that declare the same non-empty `level` serve as each other's
+  # fallback tier: when every target of the requested profile fails or times
+  # out, same-level profiles are tried in priority order (lower `priority`
+  # first, then profile name).
+  #
+  # `retries` is the number of full passes over the attempt list before the
+  # request is reported as failed; `retry_backoff` waits between passes. Give
+  # the profile you must not lose (orchestrator) the highest retry budget and
+  # the lowest priority number.
   orchestrator:
+    level: reasoning
+    priority: 0
+    retries: 5
+    retry_backoff: 1s
     targets:
       - backend: cliproxy
         model: YOUR_MODEL
   coder:
+    level: reasoning
+    priority: 10
     targets:
       - backend: cliproxy
         model: YOUR_MODEL
+      # `timeout` bounds one attempt before its first meaningful output so a
+      # hung upstream falls back instead of stalling the request.
       - backend: openrouter
         model: YOUR_MODEL
+        timeout: 45s
   reviewer:
+    level: reasoning
+    priority: 10
     targets:
       - backend: openrouter
         model: YOUR_MODEL
   fast:
+    level: speed
     targets:
       - backend: openrouter
         model: YOUR_MODEL
-  nvidia/deepseek-ai/deepseek-v4-flash-0731:
-    targets:
-      - backend: nvidia
-        model: deepseek-ai/deepseek-v4-flash-0731
-      - backend: nvidia-2
-        model: deepseek-ai/deepseek-v4-flash-0731
+        timeout: 30s
 
 logging:
   verbose: false

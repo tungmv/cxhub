@@ -336,9 +336,11 @@ func configureCodexFile(path string) (bool, error) {
 		}
 	}
 	if !foundProvider {
-		lines = append([]string{`model_provider = "cxhub"`, `model = "orchestrator"`, ""}, lines...)
+		lines = append([]string{`model_provider = "cxhub"`, `model = "orchestrator"`, `model_catalog_json = "~/.codex/model_catalog.json"`, ""}, lines...)
 	} else if !foundModel {
-		lines = append([]string{`model = "orchestrator"`}, lines...)
+		lines = append([]string{`model = "orchestrator"`, `model_catalog_json = "~/.codex/model_catalog.json"`}, lines...)
+	} else if !strings.Contains(strings.Join(lines, "\n"), "model_catalog_json =") {
+		lines = append([]string{`model_catalog_json = "~/.codex/model_catalog.json"`}, lines...)
 	}
 	updated := strings.TrimRight(strings.Join(lines, "\n"), "\n") + "\n\n[model_providers.cxhub]\nname = \"cxhub\"\nbase_url = \"http://127.0.0.1:8787/v1\"\nwire_api = \"responses\"\nrequires_openai_auth = false\nsupports_websockets = false\n"
 	if err := writeAtomic(path+".bak-cxhub", original, 0o600); err != nil {

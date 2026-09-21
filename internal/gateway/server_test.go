@@ -19,11 +19,13 @@ import (
 )
 
 type fakeUpstream struct {
-	mu       sync.Mutex
-	requests []fakeRequest
-	status   int
-	delay    time.Duration
-	events   []string
+	mu        sync.Mutex
+	requests  []fakeRequest
+	status    int
+	delay     time.Duration
+	stagger   time.Duration
+	failFirst int
+	events    []string
 }
 
 type fakeRequest struct {
@@ -51,7 +53,10 @@ func (f *fakeUpstream) handler(w http.ResponseWriter, r *http.Request) {
 	f.requests = append(f.requests, fakeRequest{Model: payload.Model})
 	status := f.status
 	delay := f.delay
+	stagger := f.stagger
+	failFirst := f.failFirst
 	events := append([]string(nil), f.events...)
+	attempt := len(f.requests)
 	f.mu.Unlock()
 	if delay > 0 {
 		select {
@@ -60,7 +65,7 @@ func (f *fakeUpstream) handler(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	if status != 0 && status != http.StatusOK {
+	if status != 0 && status != http.StatusOK && (failFirst == 0 || attempt <= failFirst) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(status)
 		_, _ = io.WriteString(w, `{"error":{"message":"fake upstream failure"}}`)
@@ -72,6 +77,13 @@ func (f *fakeUpstream) handler(w http.ResponseWriter, r *http.Request) {
 		for _, event := range events {
 			_, _ = io.WriteString(w, event)
 			flusher.Flush()
+			if stagger > 0 {
+				select {
+				case <-time.After(stagger):
+				case <-r.Context().Done():
+					return
+				}
+			}
 		}
 		return
 	}
@@ -244,4 +256,374 @@ func TestSSEParserHandlesMultilineData(t *testing.T) {
 	}
 }
 
+func TestSameLevelCrossProfileFallback(t *testing.T) {
+	primary := &fakeUpstream{status: http.StatusBadGateway}
+	backup := &fakeUpstream{events: []string{event("response.output_text.delta", `{"delta":"from-planner"}`), "data: [DONE]\n\n"}}
+	otherLevel := &fakeUpstream{events: []string{event("response.output_text.delta", `{"delta":"wrong-tier"}`), "data: [DONE]\n\n"}}
+	server, fakes := newTestGateway(t, map[string]*fakeUpstream{"primary": primary, "backup": backup, "other": otherLevel}, map[string]config.ProfileConfig{
+		"coder":   {Level: "reasoning", Targets: []config.TargetConfig{{Backend: "primary", Model: "m-coder"}}},
+		"planner": {Level: "reasoning", Targets: []config.TargetConfig{{Backend: "backup", Model: "m-planner"}}},
+		"fast":    {Level: "speed", Targets: []config.TargetConfig{{Backend: "other", Model: "m-fast"}}},
+	})
+	response, err := server.Client().Post(server.URL+"/v1/responses", "application/json", strings.NewReader(`{"model":"coder","stream":true}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	body, _ := io.ReadAll(response.Body)
+	if response.StatusCode != http.StatusOK || !strings.Contains(string(body), "from-planner") {
+		t.Fatalf("same-level fallback failed: status=%d body=%s", response.StatusCode, body)
+	}
+	if got := modelRequests(t, fakes, "backup"); len(got) != 1 || got[0] != "m-planner" {
+		t.Fatalf("backup backend requests = %v", got)
+	}
+	if got := modelRequests(t, fakes, "other"); len(got) != 0 {
+		t.Fatalf("different-level backend was contacted: %v", got)
+	}
+}
+
+func TestProfilesWithoutLevelDoNotCrossFallback(t *testing.T) {
+	primary := &fakeUpstream{status: http.StatusServiceUnavailable}
+	backup := &fakeUpstream{}
+	server, fakes := newTestGateway(t, map[string]*fakeUpstream{"primary": primary, "backup": backup}, map[string]config.ProfileConfig{
+		"coder":   {Targets: []config.TargetConfig{{Backend: "primary", Model: "m-coder"}}},
+		"planner": {Targets: []config.TargetConfig{{Backend: "backup", Model: "m-planner"}}},
+	})
+	response, err := server.Client().Post(server.URL+"/v1/responses", "application/json", strings.NewReader(`{"model":"coder","stream":true}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d", response.StatusCode)
+	}
+	if got := modelRequests(t, fakes, "backup"); len(got) != 0 {
+		t.Fatalf("level-less profile gained cross-profile fallback: %v", got)
+	}
+}
+
+func TestSameLevelSkipsDuplicateTargets(t *testing.T) {
+	shared := &fakeUpstream{}
+	server, fakes := newTestGateway(t, map[string]*fakeUpstream{"shared": shared}, map[string]config.ProfileConfig{
+		"coder":   {Level: "reasoning", Targets: []config.TargetConfig{{Backend: "shared", Model: "m"}}},
+		"planner": {Level: "reasoning", Targets: []config.TargetConfig{{Backend: "shared", Model: "m"}}},
+	})
+	response, err := server.Client().Post(server.URL+"/v1/responses", "application/json", strings.NewReader(`{"model":"coder","stream":false}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	body, _ := io.ReadAll(response.Body)
+	if response.StatusCode != http.StatusOK || !strings.Contains(string(body), `"id":"resp-m"`) {
+		t.Fatalf("duplicate target handling failed: status=%d body=%s", response.StatusCode, body)
+	}
+	if got := modelRequests(t, fakes, "shared"); len(got) != 1 {
+		t.Fatalf("duplicate target was retried: %v", got)
+	}
+}
+
+func TestTargetTimeoutFallsBack(t *testing.T) {
+	slow := &fakeUpstream{delay: 400 * time.Millisecond}
+	quick := &fakeUpstream{events: []string{event("response.output_text.delta", `{"delta":"recovered"}`), "data: [DONE]\n\n"}}
+	server, fakes := newTestGateway(t, map[string]*fakeUpstream{"slow": slow, "quick": quick}, map[string]config.ProfileConfig{
+		"coder": {Targets: []config.TargetConfig{{Backend: "slow", Model: "m-slow", Timeout: "50ms"}, {Backend: "quick", Model: "m-quick"}}},
+	})
+	started := time.Now()
+	response, err := server.Client().Post(server.URL+"/v1/responses", "application/json", strings.NewReader(`{"model":"coder","stream":true}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	body, _ := io.ReadAll(response.Body)
+	if response.StatusCode != http.StatusOK || !strings.Contains(string(body), "recovered") {
+		t.Fatalf("timeout fallback failed: status=%d body=%s", response.StatusCode, body)
+	}
+	if elapsed := time.Since(started); elapsed > 300*time.Millisecond {
+		t.Fatalf("timeout fallback waited too long: %s", elapsed)
+	}
+	if got := modelRequests(t, fakes, "quick"); len(got) != 1 || got[0] != "m-quick" {
+		t.Fatalf("quick backend requests = %v", got)
+	}
+}
+
+func TestAllTargetsTimedOutReturns504(t *testing.T) {
+	slowOne := &fakeUpstream{delay: 300 * time.Millisecond}
+	slowTwo := &fakeUpstream{delay: 300 * time.Millisecond}
+	server, _ := newTestGateway(t, map[string]*fakeUpstream{"slow-one": slowOne, "slow-two": slowTwo}, map[string]config.ProfileConfig{
+		"coder": {Targets: []config.TargetConfig{{Backend: "slow-one", Model: "m1", Timeout: "50ms"}, {Backend: "slow-two", Model: "m2", Timeout: "50ms"}}},
+	})
+	response, err := server.Client().Post(server.URL+"/v1/responses", "application/json", strings.NewReader(`{"model":"coder","stream":true}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	body, _ := io.ReadAll(response.Body)
+	if response.StatusCode != http.StatusGatewayTimeout || !strings.Contains(string(body), "upstream request timed out") {
+		t.Fatalf("expected 504 timeout error, got status=%d body=%s", response.StatusCode, body)
+	}
+}
+
+func TestTargetTimeoutDisarmedAfterFirstEvent(t *testing.T) {
+	first := &fakeUpstream{delay: 10 * time.Millisecond, stagger: 150 * time.Millisecond, events: []string{
+		event("response.output_text.delta", `{"delta":"start"}`),
+		// This event arrives long after the configured attempt timeout expired.
+		event("response.output_text.delta", `{"delta":"-and-finish"}`),
+		"data: [DONE]\n\n",
+	}}
+	server, _ := newTestGateway(t, map[string]*fakeUpstream{"x": first}, map[string]config.ProfileConfig{
+		"coder": {Targets: []config.TargetConfig{{Backend: "x", Model: "m", Timeout: "50ms"}}},
+	})
+	response, err := server.Client().Post(server.URL+"/v1/responses", "application/json", strings.NewReader(`{"model":"coder","stream":true}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	body, _ := io.ReadAll(response.Body)
+	if response.StatusCode != http.StatusOK || !strings.Contains(string(body), "start") || !strings.Contains(string(body), "-and-finish") {
+		t.Fatalf("healthy generation was cut by attempt timeout: status=%d body=%s", response.StatusCode, body)
+	}
+}
+
+func modelRequests(t *testing.T, fakes map[string]*fakeUpstream, backend string) []string {
+	t.Helper()
+	fake := fakes[backend]
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	models := make([]string, 0, len(fake.requests))
+	for _, request := range fake.requests {
+		models = append(models, request.Model)
+	}
+	return models
+}
+
+func TestOrchestratorRetriesUntilSuccess(t *testing.T) {
+	flaky := &fakeUpstream{status: http.StatusBadGateway, failFirst: 2}
+	server, fakes := newTestGateway(t, map[string]*fakeUpstream{"flaky": flaky}, map[string]config.ProfileConfig{
+		"orchestrator": {Retries: 3, RetryBackoff: "20ms", Targets: []config.TargetConfig{{Backend: "flaky", Model: "m-orchestrator"}}},
+	})
+	started := time.Now()
+	response, err := server.Client().Post(server.URL+"/v1/responses", "application/json", strings.NewReader(`{"model":"orchestrator","stream":false}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	body, _ := io.ReadAll(response.Body)
+	if response.StatusCode != http.StatusOK || !strings.Contains(string(body), `"id":"resp-m-orchestrator"`) {
+		t.Fatalf("retry-until-success failed: status=%d body=%s", response.StatusCode, body)
+	}
+	if got := modelRequests(t, fakes, "flaky"); len(got) != 3 {
+		t.Fatalf("expected 3 attempts, got %v", got)
+	}
+	if elapsed := time.Since(started); elapsed < 40*time.Millisecond {
+		t.Fatalf("retry backoff was not applied: %s", elapsed)
+	}
+}
+
+func TestRetriesExhaustedStillReportsFailure(t *testing.T) {
+	dead := &fakeUpstream{status: http.StatusBadGateway, failFirst: 2}
+	server, _ := newTestGateway(t, map[string]*fakeUpstream{"dead": dead}, map[string]config.ProfileConfig{
+		"orchestrator": {Retries: 2, Targets: []config.TargetConfig{{Backend: "dead", Model: "m"}}},
+	})
+	response, err := server.Client().Post(server.URL+"/v1/responses", "application/json", strings.NewReader(`{"model":"orchestrator","stream":false}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusBadGateway {
+		t.Fatalf("status = %d", response.StatusCode)
+	}
+}
+
+func TestPriorityOrdersSameLevelFallback(t *testing.T) {
+	preferred := &fakeUpstream{status: http.StatusBadGateway} // high priority, fails
+	backup := &fakeUpstream{events: []string{event("response.output_text.delta", `{"delta":"ok"}`), "data: [DONE]\n\n"}}
+	server, fakes := newTestGateway(t, map[string]*fakeUpstream{"preferred": preferred, "backup": backup}, map[string]config.ProfileConfig{
+		"z-preferred": {Level: "reasoning", Priority: -1, Targets: []config.TargetConfig{{Backend: "preferred", Model: "m-top"}}},
+		"a-backup":    {Level: "reasoning", Priority: 10, Targets: []config.TargetConfig{{Backend: "backup", Model: "m-backup"}}},
+		"coder":       {Level: "reasoning", Targets: []config.TargetConfig{{Backend: "preferred", Model: "m-coder"}}},
+	})
+	response, err := server.Client().Post(server.URL+"/v1/responses", "application/json", strings.NewReader(`{"model":"coder","stream":true}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	body, _ := io.ReadAll(response.Body)
+	if response.StatusCode != http.StatusOK || !strings.Contains(string(body), `"delta":"ok"`) {
+		t.Fatalf("priority fallback failed: status=%d body=%s", response.StatusCode, body)
+	}
+	// The high-priority profile must be attempted before the alphabetically
+	// first low-priority profile.
+	if got := modelRequests(t, fakes, "preferred"); len(got) == 0 {
+		t.Fatalf("high-priority profile was never attempted; fallback order is wrong")
+	}
+	if got := modelRequests(t, fakes, "backup"); len(got) != 1 || got[0] != "m-backup" {
+		t.Fatalf("backup backend requests = %v", got)
+	}
+}
+
+func TestNonFallbackableStatusAdvancesWhenAttemptsRemain(t *testing.T) {
+	rejecting := &fakeUpstream{status: http.StatusBadRequest}
+	healthy := &fakeUpstream{events: []string{event("response.output_text.delta", `{"delta":"ok"}`), "data: [DONE]\n\n"}}
+	server, _ := newTestGateway(t, map[string]*fakeUpstream{"rejecting": rejecting, "healthy": healthy}, map[string]config.ProfileConfig{
+		"coder": {Targets: []config.TargetConfig{{Backend: "rejecting", Model: "one"}, {Backend: "healthy", Model: "two"}}},
+	})
+	response, err := server.Client().Post(server.URL+"/v1/responses", "application/json", strings.NewReader(`{"model":"coder","stream":true}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	body, _ := io.ReadAll(response.Body)
+	if response.StatusCode != http.StatusOK || !strings.Contains(string(body), `"delta":"ok"`) {
+		t.Fatalf("unexpected failure with attempts remaining: status=%d body=%s", response.StatusCode, body)
+	}
+}
+
+func TestFinalNonFallbackableStatusSurfaces(t *testing.T) {
+	rejecting := &fakeUpstream{status: http.StatusBadRequest}
+	server, _ := newTestGateway(t, map[string]*fakeUpstream{"rejecting": rejecting}, map[string]config.ProfileConfig{
+		"coder": {Targets: []config.TargetConfig{{Backend: "rejecting", Model: "one"}}},
+	})
+	response, err := server.Client().Post(server.URL+"/v1/responses", "application/json", strings.NewReader(`{"model":"coder","stream":true}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusBadRequest {
+		t.Fatalf("status = %d", response.StatusCode)
+	}
+}
+
 func event(name, data string) string { return "event: " + name + "\ndata: " + data + "\n\n" }
+
+// An upstream may terminate a Responses SSE stream with a plain EOF instead of
+// a [DONE] sentinel. That is a clean end: the request must succeed and the
+// backend must stay healthy.
+func TestStreamEndsWithPlainEOFKeepsBackendHealthy(t *testing.T) {
+	backends := map[string]*fakeUpstream{
+		"a": {events: []string{event("response.output_text.delta", `{"delta":"ok"}`)}},
+	}
+	profiles := map[string]config.ProfileConfig{
+		"orchestrator": {Targets: []config.TargetConfig{{Backend: "a", Model: "model-a"}}},
+	}
+	providers := make(map[string]provider.Provider, len(backends))
+	backendConfig := make(map[string]config.BackendConfig, len(backends))
+	for name, fake := range backends {
+		upstream := httptest.NewServer(http.HandlerFunc(fake.handler))
+		t.Cleanup(upstream.Close)
+		backendConfig[name] = config.BackendConfig{Type: "openai-compatible", BaseURL: upstream.URL + "/v1"}
+		providers[name] = provider.NewOpenAICompatible(name, backendConfig[name], upstream.Client())
+	}
+	cfg := &config.Config{Gateway: config.GatewayConfig{Host: "127.0.0.1", Port: 8787}, Backends: backendConfig, Profiles: profiles}
+	if err := cfg.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	srv := NewServer(cfg, providers, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	server := httptest.NewServer(srv.Handler())
+	t.Cleanup(server.Close)
+
+	resp, err := http.Post(server.URL+"/v1/responses", "application/json",
+		strings.NewReader(`{"model":"orchestrator","input":"hi","stream":true}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	if !strings.Contains(string(body), "response.output_text.delta") {
+		t.Fatalf("stream did not forward delta events: %q", string(body))
+	}
+	state := srv.Health.Snapshot()["a"]
+	if !state.Healthy {
+		t.Fatalf("backend marked unhealthy after clean EOF-terminated stream: %q", state.LastError)
+	}
+}
+
+func TestAnthropicMessagesStreamEndToEnd(t *testing.T) {
+	backends := map[string]*fakeUpstream{
+		"a": {events: []string{
+			`event: response.created` + "\n" + `data: {"type":"response.created","response":{"id":"resp_1","usage":{"input_tokens":5}}}` + "\n\n",
+			`event: response.output_item.added` + "\n" + `data: {"type":"response.output_item.added","output_index":0,"item":{"type":"message","id":"m1","role":"assistant"}}` + "\n\n",
+			`event: response.output_text.delta` + "\n" + `data: {"type":"response.output_text.delta","item_id":"m1","delta":"hi there"}` + "\n\n",
+			"event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"status\":\"completed\",\"usage\":{\"input_tokens\":5,\"output_tokens\":2}}}\n\n",
+		}},
+	}
+	profiles := map[string]config.ProfileConfig{
+		"orchestrator": {Targets: []config.TargetConfig{{Backend: "a", Model: "model-a"}}},
+	}
+	providers := make(map[string]provider.Provider, len(backends))
+	backendConfig := make(map[string]config.BackendConfig, len(backends))
+	for name, fake := range backends {
+		upstream := httptest.NewServer(http.HandlerFunc(fake.handler))
+		t.Cleanup(upstream.Close)
+		backendConfig[name] = config.BackendConfig{Type: "openai-compatible", BaseURL: upstream.URL + "/v1"}
+		providers[name] = provider.NewOpenAICompatible(name, backendConfig[name], upstream.Client())
+	}
+	cfg := &config.Config{Gateway: config.GatewayConfig{Host: "127.0.0.1", Port: 8787}, Backends: backendConfig, Profiles: profiles}
+	if err := cfg.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	srv := NewServer(cfg, providers, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	server := httptest.NewServer(srv.Handler())
+	t.Cleanup(server.Close)
+
+	body := `{"model":"orchestrator","max_tokens":64,"stream":true,"system":"be brief","messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}]}`
+	resp, err := http.Post(server.URL+"/v1/messages", "application/json", strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d", resp.StatusCode)
+	}
+	raw, _ := io.ReadAll(resp.Body)
+	if !strings.Contains(string(raw), "event: message_start") ||
+		!strings.Contains(string(raw), `"text":"hi there"`) ||
+		!strings.Contains(string(raw), "event: message_stop") {
+		t.Fatalf("unexpected Anthropic stream: %s", raw)
+	}
+	if !strings.Contains(string(raw), `"model":"orchestrator"`) {
+		t.Fatalf("profile not echoed: %s", raw)
+	}
+	state := srv.Health.Snapshot()["a"]
+	if !state.Healthy {
+		t.Fatalf("backend marked unhealthy after translated stream: %q", state.LastError)
+	}
+}
+
+func TestAnthropicMessagesCountTokens(t *testing.T) {
+	backends := map[string]*fakeUpstream{"a": {}}
+	profiles := map[string]config.ProfileConfig{
+		"fast": {Targets: []config.TargetConfig{{Backend: "a", Model: "m"}}},
+	}
+	providers := map[string]provider.Provider{}
+	backendConfig := map[string]config.BackendConfig{}
+	for name, fake := range backends {
+		upstream := httptest.NewServer(http.HandlerFunc(fake.handler))
+		t.Cleanup(upstream.Close)
+		backendConfig[name] = config.BackendConfig{Type: "openai-compatible", BaseURL: upstream.URL + "/v1"}
+		providers[name] = provider.NewOpenAICompatible(name, backendConfig[name], upstream.Client())
+	}
+	cfg := &config.Config{Gateway: config.GatewayConfig{Host: "127.0.0.1", Port: 8787}, Backends: backendConfig, Profiles: profiles}
+	server := httptest.NewServer(NewServer(cfg, providers, slog.New(slog.NewTextHandler(io.Discard, nil))).Handler())
+	t.Cleanup(server.Close)
+
+	resp, err := http.Post(server.URL+"/v1/messages/count_tokens", "application/json", strings.NewReader(`{"model":"fast","messages":[{"role":"user","content":"hello world"}]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d", resp.StatusCode)
+	}
+	var out struct {
+		InputTokens int `json:"input_tokens"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		t.Fatal(err)
+	}
+	if out.InputTokens < 1 {
+		t.Fatalf("input_tokens = %d", out.InputTokens)
+	}
+}

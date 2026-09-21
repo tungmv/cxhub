@@ -30,12 +30,61 @@ type BackendConfig struct {
 }
 
 type ProfileConfig struct {
-	Targets []TargetConfig `yaml:"targets"`
+	// Level groups profiles into a fallback tier. Profiles sharing the same
+	// non-empty level serve as each other's fallback targets.
+	Level string `yaml:"level"`
+	// Priority orders same-level fallback: lower numbers are tried first.
+	Priority int `yaml:"priority"`
+	// Retries is the total number of passes over the attempt list (1 = no
+	// retry, 0 = default of 1).
+	Retries int `yaml:"retries"`
+	// RetryBackoff is the wait between retry passes.
+	RetryBackoff string         `yaml:"retry_backoff"`
+	Targets      []TargetConfig `yaml:"targets"`
+}
+
+const maxRetries = 100
+
+// EffectiveRetries returns the configured number of passes over the attempt
+// list, defaulting to 1 and capped at maxRetries.
+func (p ProfileConfig) EffectiveRetries() int {
+	if p.Retries < 1 {
+		return 1
+	}
+	if p.Retries > maxRetries {
+		return maxRetries
+	}
+	return p.Retries
+}
+
+// RetryBackoffDuration returns the wait between retry passes, or 0 when unset.
+func (p ProfileConfig) RetryBackoffDuration() time.Duration {
+	if strings.TrimSpace(p.RetryBackoff) == "" {
+		return 0
+	}
+	duration, err := time.ParseDuration(p.RetryBackoff)
+	if err != nil || duration <= 0 {
+		return 0
+	}
+	return duration
 }
 
 type TargetConfig struct {
 	Backend string `yaml:"backend"`
 	Model   string `yaml:"model"`
+	Timeout string `yaml:"timeout"`
+}
+
+// TimeoutDuration returns the per-attempt timeout, or 0 when no timeout is set.
+func (t TargetConfig) TimeoutDuration() time.Duration {
+	if strings.TrimSpace(t.Timeout) == "" {
+		return 0
+	}
+	duration, err := time.ParseDuration(t.Timeout)
+	if err != nil || duration <= 0 {
+		return 0
+	}
+	return duration
 }
 
 type LoggingConfig struct {
@@ -132,11 +181,26 @@ func (c *Config) Validate() error {
 			if strings.TrimSpace(target.Model) == "" {
 				return fmt.Errorf("profile %q target %d is missing model", name, i+1)
 			}
+			if strings.TrimSpace(target.Timeout) != "" {
+				duration, err := time.ParseDuration(target.Timeout)
+				if err != nil || duration <= 0 {
+					return fmt.Errorf("profile %q target %d has invalid timeout %q: must be a positive Go duration", name, i+1, target.Timeout)
+				}
+			}
 			key := target.Backend + "\x00" + target.Model
 			if _, ok := seen[key]; ok {
 				return fmt.Errorf("profile %q contains duplicate target %s/%s", name, target.Backend, target.Model)
 			}
 			seen[key] = struct{}{}
+		}
+		if p.Retries < 0 || p.Retries > maxRetries {
+			return fmt.Errorf("profile %q retries must be between 0 and %d", name, maxRetries)
+		}
+		if strings.TrimSpace(p.RetryBackoff) != "" {
+			duration, err := time.ParseDuration(p.RetryBackoff)
+			if err != nil || duration <= 0 {
+				return fmt.Errorf("profile %q has invalid retry_backoff %q: must be a positive Go duration", name, p.RetryBackoff)
+			}
 		}
 	}
 	return nil

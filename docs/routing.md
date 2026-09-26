@@ -10,6 +10,43 @@ The request's `model` is the logical profile name. For example:
 order. Each target contains a backend ID and the real model ID. The real model is
 never advertised through `/v1/models`.
 
+## Automatic selection
+
+When decision routing is configured, `model: auto` is advertised as an additional
+logical model. cxhub sends the request's user text to OpenRouter's
+[Decisions API](https://openrouter.ai/docs/api/api-reference/alphadecisions/submit-a-decisions-request)
+using `respan/span-01-lite`, then uses the returned speed/quality scores to pick
+one `auto_tier` profile and a `low`, `medium`, or `high` reasoning effort. Image
+and audio payloads are not included in the decision request. Configure one profile
+per tier; ordinary profile names route unchanged.
+
+The selector is deliberately constrained to profiles already configured in cxhub:
+
+```yaml
+decision:
+  backend: openrouter
+  model: respan/span-01-lite
+  default_profile: orchestrator
+  timeout: 2s
+
+profiles:
+  fast:
+    auto_tier: speed
+    targets: [{backend: openrouter, model: YOUR_FAST_MODEL}]
+  orchestrator:
+    auto_tier: balanced
+    targets: [{backend: cliproxy, model: YOUR_DEFAULT_MODEL}]
+  reviewer:
+    auto_tier: quality
+    targets: [{backend: openrouter, model: YOUR_STRONG_MODEL}]
+```
+
+If classification fails or times out, cxhub routes through `default_profile` with
+medium effort. Auto selection adds a network call and transmits user text to
+OpenRouter; requests for explicit profiles do neither. The chosen effort is
+forwarded normally; reasoning-effort support still depends on the selected
+upstream model/provider.
+
 ## Same-level fallback across profiles
 
 A profile may declare an optional `level` (for example `reasoning` or `speed`).

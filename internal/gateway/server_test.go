@@ -29,7 +29,8 @@ type fakeUpstream struct {
 }
 
 type fakeRequest struct {
-	Model string
+	Model           string
+	ReasoningEffort string
 }
 
 func (f *fakeUpstream) handler(w http.ResponseWriter, r *http.Request) {
@@ -43,14 +44,17 @@ func (f *fakeUpstream) handler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var payload struct {
-		Model string `json:"model"`
+		Model     string `json:"model"`
+		Reasoning struct {
+			Effort string `json:"effort"`
+		} `json:"reasoning"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&payload); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 	f.mu.Lock()
-	f.requests = append(f.requests, fakeRequest{Model: payload.Model})
+	f.requests = append(f.requests, fakeRequest{Model: payload.Model, ReasoningEffort: payload.Reasoning.Effort})
 	status := f.status
 	delay := f.delay
 	stagger := f.stagger

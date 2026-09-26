@@ -53,3 +53,27 @@ func TestTargetTimeoutDuration(t *testing.T) {
 		}
 	}
 }
+
+func TestValidateDecisionRouting(t *testing.T) {
+	cfg := &Config{
+		Backends: map[string]BackendConfig{
+			"openrouter": {Type: "openai-compatible", BaseURL: "https://openrouter.ai/api/v1", APIKey: "key"},
+		},
+		Profiles: map[string]ProfileConfig{
+			"fast":    {AutoTier: "speed", Targets: []TargetConfig{{Backend: "openrouter", Model: "fast-model"}}},
+			"default": {AutoTier: "balanced", Targets: []TargetConfig{{Backend: "openrouter", Model: "default-model"}}},
+			"strong":  {AutoTier: "quality", Targets: []TargetConfig{{Backend: "openrouter", Model: "strong-model"}}},
+		},
+		Decision: DecisionConfig{Backend: "openrouter", DefaultProfile: "default"},
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Decision.Model != "respan/span-01-lite" {
+		t.Fatalf("default decision model = %q", cfg.Decision.Model)
+	}
+	cfg.Profiles["other"] = cfg.Profiles["fast"]
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("expected duplicate auto tier error")
+	}
+}

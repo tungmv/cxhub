@@ -2,7 +2,9 @@
 
 `cxhub` is a small local OpenAI Responses gateway for Codex CLI. Codex sees a short
 logical model roster; `cxhub` privately maps each logical profile to configured
-provider/model targets.
+provider/model targets. An optional `auto` model uses OpenRouter's Span-01 Lite
+decision API to select a configured speed, balanced, or quality profile and a
+reasoning effort for each request.
 
 It is written entirely in Go and has no dashboard, database, catalog synchronizer,
 account pool, or tool execution layer.
@@ -45,7 +47,7 @@ file, preserving unrelated settings:
 
 ```toml
 model_provider = "cxhub"
-model = "orchestrator"
+model = "auto"
 model_catalog_json = "~/.codex/model_catalog.json"
 
 [model_providers.cxhub]
@@ -105,6 +107,15 @@ can declare `retries`/`retry_backoff` to make a critical profile such as the
 orchestrator practically never fail. See
 [docs/routing.md](/Users/tony/build/cxhub/docs/routing.md) and
 [docs/architecture.md](/Users/tony/build/cxhub/docs/architecture.md).
+
+For automatic routing, set `decision.backend`, `decision.model`, and
+`decision.default_profile`; set `auto_tier: speed|balanced|quality` on at most one
+profile per tier. Codex can then use `model = "auto"` (including in custom agent
+TOML files). The selector scores only request text using OpenRouter's
+[Decisions API](https://openrouter.ai/docs/api/api-reference/alphadecisions/submit-a-decisions-request).
+It sends user text to OpenRouter; image/audio contents are not sent. If selection
+fails, cxhub uses `default_profile` with medium reasoning effort. Explicit named
+profiles bypass selection.
 
 ## Operations
 

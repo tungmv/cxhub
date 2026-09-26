@@ -15,7 +15,7 @@ The current configuration uses the TOML provider mechanism:
 
 ```toml
 model_provider = "cliproxy"
-model = "gpt-5.6-luna"
+model = "gpt-6-luna"
 model_reasoning_effort = "high"
 
 [model_providers.cliproxy]

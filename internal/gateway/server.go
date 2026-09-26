@@ -28,6 +28,7 @@ type Server struct {
 	Health    *health.Registry
 	Logger    *slog.Logger
 	HTTP      *http.Server
+	Decider   decisionScorer
 }
 
 func NewServer(cfg *config.Config, providers map[string]provider.Provider, logger *slog.Logger) *Server {
@@ -38,7 +39,11 @@ func NewServer(cfg *config.Config, providers map[string]provider.Provider, logge
 	for name := range providers {
 		names = append(names, name)
 	}
-	return &Server{Config: cfg, Router: routing.New(cfg, providers), Providers: providers, Health: health.New(names), Logger: logger}
+	server := &Server{Config: cfg, Router: routing.New(cfg, providers), Providers: providers, Health: health.New(names), Logger: logger}
+	if cfg.Decision.Backend != "" {
+		server.Decider = newSpanDecision(cfg.Decision, cfg.Backends[cfg.Decision.Backend])
+	}
+	return server
 }
 
 func (s *Server) Handler() http.Handler {
@@ -70,6 +75,9 @@ func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
 
 func (s *Server) handleModels(w http.ResponseWriter, _ *http.Request) {
 	data := make([]map[string]any, 0, len(s.Router.Profiles()))
+	if s.Decider != nil {
+		data = append(data, map[string]any{"id": "auto", "object": "model", "owned_by": "cxhub"})
+	}
 	for _, profile := range s.Router.Profiles() {
 		data = append(data, map[string]any{"id": profile, "object": "model", "owned_by": "cxhub"})
 	}
@@ -84,6 +92,7 @@ func (s *Server) handleStatus(w http.ResponseWriter, _ *http.Request) {
 			state := backendStates[target.Backend]
 			profileStatus[profile] = append(profileStatus[profile], map[string]any{
 				"level":      strings.TrimSpace(definition.Level),
+				"auto_tier":  definition.AutoTier,
 				"priority":   definition.Priority,
 				"retries":    definition.EffectiveRetries(),
 				"backend":    target.Backend,
@@ -96,6 +105,7 @@ func (s *Server) handleStatus(w http.ResponseWriter, _ *http.Request) {
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"gateway":  map[string]any{"address": s.Config.Address(), "status": "ok"},
+		"decision": map[string]any{"enabled": s.Decider != nil, "model": s.Config.Decision.Model},
 		"backends": backendStates,
 		"profiles": profileStatus,
 	})
@@ -147,6 +157,21 @@ func (s *Server) serveRequest(w http.ResponseWriter, r *http.Request, req *respo
 	if profile == "" {
 		writeError(w, http.StatusBadRequest, "model is required and must be a configured logical profile", requestID)
 		return
+	}
+	if profile == "auto" {
+		selected, effort, scores, err := s.automaticRoute(r.Context(), req)
+		if err != nil {
+			selected = s.Config.Decision.DefaultProfile
+			effort = "medium"
+			s.Logger.Warn("automatic route decision failed; using default profile", "request_id", requestID, "profile", selected, "error", err)
+		} else {
+			s.Logger.Info("automatic route selected", "request_id", requestID, "profile", selected, "reasoning_effort", effort, "speed_score", scores.Speed, "quality_score", scores.Quality, "high_effort_score", scores.HighEffort)
+		}
+		if err := req.SetReasoningEffort(effort); err != nil {
+			writeError(w, http.StatusBadRequest, err.Error(), requestID)
+			return
+		}
+		profile = selected
 	}
 	targets, err := s.Router.Resolve(profile)
 	if err != nil {

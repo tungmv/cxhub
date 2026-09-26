@@ -215,6 +215,9 @@ func modelsCommand(args []string) error {
 		return err
 	}
 	profiles := make([]string, 0, len(cfg.Profiles))
+	if cfg.Decision.Backend != "" {
+		profiles = append(profiles, "auto")
+	}
 	for name := range cfg.Profiles {
 		profiles = append(profiles, name)
 	}

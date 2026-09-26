@@ -38,6 +38,7 @@ profiles:
   # the profile you must not lose (orchestrator) the highest retry budget and
   # the lowest priority number.
   orchestrator:
+    auto_tier: balanced
     level: reasoning
     priority: 0
     retries: 5
@@ -57,17 +58,27 @@ profiles:
         model: YOUR_MODEL
         timeout: 45s
   reviewer:
+    auto_tier: quality
     level: reasoning
     priority: 10
     targets:
       - backend: openrouter
         model: YOUR_MODEL
   fast:
+    auto_tier: speed
     level: speed
     targets:
       - backend: openrouter
         model: YOUR_MODEL
         timeout: 30s
+
+# Requests using logical model "auto" are classified by this OpenRouter model.
+# Only user text is sent for classification; a failure routes to the default.
+decision:
+  backend: openrouter
+  model: respan/span-01-lite
+  default_profile: orchestrator
+  timeout: 2s
 
 logging:
   verbose: false

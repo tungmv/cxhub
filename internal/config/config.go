@@ -12,7 +12,26 @@ type Config struct {
 	Gateway  GatewayConfig            `yaml:"gateway"`
 	Backends map[string]BackendConfig `yaml:"backends"`
 	Profiles map[string]ProfileConfig `yaml:"profiles"`
+	Decision DecisionConfig           `yaml:"decision"`
 	Logging  LoggingConfig            `yaml:"logging"`
+}
+
+type DecisionConfig struct {
+	Backend        string `yaml:"backend"`
+	Model          string `yaml:"model"`
+	DefaultProfile string `yaml:"default_profile"`
+	Timeout        string `yaml:"timeout"`
+}
+
+func (d DecisionConfig) TimeoutDuration() time.Duration {
+	if strings.TrimSpace(d.Timeout) == "" {
+		return 2 * time.Second
+	}
+	duration, err := time.ParseDuration(d.Timeout)
+	if err != nil || duration <= 0 {
+		return 2 * time.Second
+	}
+	return duration
 }
 
 type GatewayConfig struct {
@@ -30,6 +49,8 @@ type BackendConfig struct {
 }
 
 type ProfileConfig struct {
+	// AutoTier lets the decision model choose this profile for automatic routing.
+	AutoTier string `yaml:"auto_tier"`
 	// Level groups profiles into a fallback tier. Profiles sharing the same
 	// non-empty level serve as each other's fallback targets.
 	Level string `yaml:"level"`
@@ -160,15 +181,62 @@ func (c *Config) Validate() error {
 	if len(c.Profiles) == 0 {
 		return fmt.Errorf("at least one profile is required")
 	}
+	decisionConfigured := c.Decision.Backend != "" || c.Decision.Model != "" || c.Decision.DefaultProfile != "" || c.Decision.Timeout != ""
+	if decisionConfigured {
+		if c.Decision.Backend == "" {
+			return fmt.Errorf("decision.backend is required")
+		}
+		backend, ok := c.Backends[c.Decision.Backend]
+		if !ok {
+			return fmt.Errorf("decision.backend %q does not exist", c.Decision.Backend)
+		}
+		if backend.APIKey == "" {
+			return fmt.Errorf("decision backend %q requires an API key", c.Decision.Backend)
+		}
+		decisionURL, _ := url.Parse(backend.BaseURL)
+		if !strings.EqualFold(decisionURL.Hostname(), "openrouter.ai") {
+			return fmt.Errorf("decision.backend %q must point to openrouter.ai", c.Decision.Backend)
+		}
+		if c.Decision.Model == "" {
+			c.Decision.Model = "respan/span-01-lite"
+		}
+		if c.Decision.DefaultProfile == "" {
+			return fmt.Errorf("decision.default_profile is required")
+		}
+		if _, ok := c.Profiles[c.Decision.DefaultProfile]; !ok {
+			return fmt.Errorf("decision.default_profile %q does not exist", c.Decision.DefaultProfile)
+		}
+		if strings.TrimSpace(c.Decision.Timeout) != "" {
+			duration, err := time.ParseDuration(c.Decision.Timeout)
+			if err != nil || duration <= 0 {
+				return fmt.Errorf("decision.timeout must be a positive Go duration, got %q", c.Decision.Timeout)
+			}
+		}
+	}
 	profileNames := make([]string, 0, len(c.Profiles))
 	for name := range c.Profiles {
 		profileNames = append(profileNames, name)
 	}
 	sort.Strings(profileNames)
+	seenAutoTiers := make(map[string]string, 3)
 	for _, name := range profileNames {
 		p := c.Profiles[name]
 		if strings.TrimSpace(name) == "" {
 			return fmt.Errorf("profile name must not be empty")
+		}
+		if name == "auto" {
+			return fmt.Errorf("profile name %q is reserved for automatic routing", name)
+		}
+		p.AutoTier = strings.TrimSpace(p.AutoTier)
+		if tier := p.AutoTier; tier != "" && tier != "speed" && tier != "balanced" && tier != "quality" {
+			return fmt.Errorf("profile %q has invalid auto_tier %q: must be speed, balanced, or quality", name, p.AutoTier)
+		}
+		c.Profiles[name] = p
+		if decisionConfigured && p.AutoTier != "" {
+			if previous, exists := seenAutoTiers[p.AutoTier]; exists {
+				return fmt.Errorf("profiles %q and %q share auto_tier %q", previous, name, p.AutoTier)
+			}
+			seenAutoTiers[p.AutoTier] = name
 		}
 		if len(p.Targets) == 0 {
 			return fmt.Errorf("profile %q must have at least one target", name)
@@ -202,6 +270,9 @@ func (c *Config) Validate() error {
 				return fmt.Errorf("profile %q has invalid retry_backoff %q: must be a positive Go duration", name, p.RetryBackoff)
 			}
 		}
+	}
+	if decisionConfigured && len(seenAutoTiers) == 0 {
+		return fmt.Errorf("automatic routing requires at least one profile with auto_tier")
 	}
 	return nil
 }

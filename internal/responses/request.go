@@ -48,3 +48,33 @@ func (r *Request) WithModel(model string) ([]byte, error) {
 	}
 	return out.Bytes(), nil
 }
+
+func (r *Request) SetReasoningEffort(effort string) error {
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(r.Body, &fields); err != nil {
+		return fmt.Errorf("invalid request body: %w", err)
+	}
+	var reasoning map[string]json.RawMessage
+	if raw := fields["reasoning"]; len(raw) > 0 {
+		if err := json.Unmarshal(raw, &reasoning); err != nil {
+			return fmt.Errorf("reasoning must be an object: %w", err)
+		}
+	}
+	if reasoning == nil {
+		reasoning = make(map[string]json.RawMessage)
+	}
+	encoded, err := json.Marshal(effort)
+	if err != nil {
+		return err
+	}
+	reasoning["effort"] = encoded
+	fields["reasoning"], err = json.Marshal(reasoning)
+	if err != nil {
+		return err
+	}
+	r.Body, err = json.Marshal(fields)
+	if err != nil {
+		return err
+	}
+	return nil
+}

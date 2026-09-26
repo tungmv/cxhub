@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"net/http"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"cxhub/internal/config"
@@ -22,28 +23,50 @@ import (
 )
 
 type Server struct {
-	Config    *config.Config
-	Router    *routing.Router
-	Providers map[string]provider.Provider
-	Health    *health.Registry
-	Logger    *slog.Logger
-	HTTP      *http.Server
-	Decider   decisionScorer
+	state  atomic.Pointer[runtimeState]
+	Logger *slog.Logger
+	HTTP   *http.Server
+}
+
+type runtimeState struct {
+	config    *config.Config
+	router    *routing.Router
+	health    *health.Registry
+	providers map[string]provider.Provider
+	decider   decisionScorer
 }
 
 func NewServer(cfg *config.Config, providers map[string]provider.Provider, logger *slog.Logger) *Server {
 	if logger == nil {
 		logger = slog.Default()
 	}
+	s := &Server{Logger: logger}
+	s.state.Store(newRuntimeState(cfg, providers))
+	return s
+}
+
+func newRuntimeState(cfg *config.Config, providers map[string]provider.Provider) *runtimeState {
 	names := make([]string, 0, len(providers))
 	for name := range providers {
 		names = append(names, name)
 	}
-	server := &Server{Config: cfg, Router: routing.New(cfg, providers), Providers: providers, Health: health.New(names), Logger: logger}
-	if cfg.Decision.Backend != "" {
-		server.Decider = newSpanDecision(cfg.Decision, cfg.Backends[cfg.Decision.Backend])
+	state := &runtimeState{
+		config: cfg, router: routing.New(cfg, providers), health: health.New(names), providers: providers,
 	}
-	return server
+	if cfg.Decision.Backend != "" {
+		state.decider = newSpanDecision(cfg.Decision, cfg.Backends[cfg.Decision.Backend])
+	}
+	return state
+}
+
+// UpdateConfig atomically applies a validated config without interrupting in-flight requests.
+func (s *Server) UpdateConfig(cfg *config.Config, providers map[string]provider.Provider) error {
+	current := s.state.Load()
+	if cfg.Address() != current.config.Address() {
+		return fmt.Errorf("gateway address changes require restart")
+	}
+	s.state.Store(newRuntimeState(cfg, providers))
+	return nil
 }
 
 func (s *Server) Handler() http.Handler {
@@ -58,7 +81,7 @@ func (s *Server) Handler() http.Handler {
 }
 
 func (s *Server) Start() error {
-	s.HTTP = &http.Server{Addr: s.Config.Address(), Handler: s.Handler(), ReadHeaderTimeout: 10 * time.Second, IdleTimeout: 90 * time.Second}
+	s.HTTP = &http.Server{Addr: s.state.Load().config.Address(), Handler: s.Handler(), ReadHeaderTimeout: 10 * time.Second, IdleTimeout: 90 * time.Second}
 	return s.HTTP.ListenAndServe()
 }
 
@@ -74,40 +97,36 @@ func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
 }
 
 func (s *Server) handleModels(w http.ResponseWriter, _ *http.Request) {
-	data := make([]map[string]any, 0, len(s.Router.Profiles()))
-	if s.Decider != nil {
+	state := s.state.Load()
+	data := make([]map[string]any, 0, len(state.router.Profiles())+1)
+	if state.decider != nil {
 		data = append(data, map[string]any{"id": "auto", "object": "model", "owned_by": "cxhub"})
 	}
-	for _, profile := range s.Router.Profiles() {
+	for _, profile := range state.router.Profiles() {
 		data = append(data, map[string]any{"id": profile, "object": "model", "owned_by": "cxhub"})
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"object": "list", "data": data})
 }
 
 func (s *Server) handleStatus(w http.ResponseWriter, _ *http.Request) {
-	backendStates := s.Health.Snapshot()
-	profileStatus := make(map[string][]map[string]any, len(s.Config.Profiles))
-	for profile, definition := range s.Config.Profiles {
+	state := s.state.Load()
+	backendStates := state.health.Snapshot()
+	profileStatus := make(map[string][]map[string]any, len(state.config.Profiles))
+	for profile, definition := range state.config.Profiles {
 		for _, target := range definition.Targets {
-			state := backendStates[target.Backend]
+			backendState := backendStates[target.Backend]
 			profileStatus[profile] = append(profileStatus[profile], map[string]any{
-				"level":      strings.TrimSpace(definition.Level),
-				"auto_tier":  definition.AutoTier,
-				"priority":   definition.Priority,
-				"retries":    definition.EffectiveRetries(),
-				"backend":    target.Backend,
-				"model":      target.Model,
-				"healthy":    state.Healthy,
-				"last_check": state.LastCheck,
-				"last_error": state.LastError,
+				"level": strings.TrimSpace(definition.Level), "auto_tier": definition.AutoTier,
+				"priority": definition.Priority, "retries": definition.EffectiveRetries(),
+				"backend": target.Backend, "model": target.Model, "healthy": backendState.Healthy,
+				"last_check": backendState.LastCheck, "last_error": backendState.LastError,
 			})
 		}
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"gateway":  map[string]any{"address": s.Config.Address(), "status": "ok"},
-		"decision": map[string]any{"enabled": s.Decider != nil, "model": s.Config.Decision.Model},
-		"backends": backendStates,
-		"profiles": profileStatus,
+		"gateway":  map[string]any{"address": state.config.Address(), "status": "ok"},
+		"decision": map[string]any{"enabled": state.decider != nil, "model": state.config.Decision.Model},
+		"backends": backendStates, "profiles": profileStatus,
 	})
 }
 
@@ -153,15 +172,16 @@ type responseWrapper func(*http.Response) (*http.Response, error)
 func (s *Server) serveRequest(w http.ResponseWriter, r *http.Request, req *responses.Request, wrap responseWrapper) {
 	started := time.Now()
 	requestID := requestIDFromContext(r.Context())
+	state := s.state.Load()
 	profile := req.Model
 	if profile == "" {
 		writeError(w, http.StatusBadRequest, "model is required and must be a configured logical profile", requestID)
 		return
 	}
 	if profile == "auto" {
-		selected, effort, scores, err := s.automaticRoute(r.Context(), req)
+		selected, effort, scores, err := s.automaticRoute(r.Context(), state, req)
 		if err != nil {
-			selected = s.Config.Decision.DefaultProfile
+			selected = state.config.Decision.DefaultProfile
 			effort = "medium"
 			s.Logger.Warn("automatic route decision failed; using default profile", "request_id", requestID, "profile", selected, "error", err)
 		} else {
@@ -173,7 +193,7 @@ func (s *Server) serveRequest(w http.ResponseWriter, r *http.Request, req *respo
 		}
 		profile = selected
 	}
-	targets, err := s.Router.Resolve(profile)
+	targets, err := state.router.Resolve(profile)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err.Error(), requestID)
 		return
@@ -187,15 +207,11 @@ func (s *Server) serveRequest(w http.ResponseWriter, r *http.Request, req *respo
 	rounds, backoff := attemptRounds(targets)
 	for round := 0; round < rounds; round++ {
 		if round > 0 && !sleepBeforeRetry(r.Context(), backoff) {
-			// The client is gone; no further attempt can help.
 			s.writeUpstreamFailure(w, requestID, timedOut, lastErr)
 			return
 		}
 		for index, target := range targets {
 			moreAttempts := index+1 < len(targets) || round+1 < rounds
-			// Each attempt gets its own context. When the target declares a timeout,
-			// a timer cancels the attempt before any output so the next target can
-			// serve the request; the timer is disarmed on first meaningful output.
 			attemptCtx := r.Context()
 			cancelAttempt := func() {}
 			var timer *time.Timer
@@ -210,7 +226,7 @@ func (s *Server) serveRequest(w http.ResponseWriter, r *http.Request, req *respo
 				cancelAttempt()
 				timedOut = timedOut || attemptDeadlineHit
 				lastErr = callErr
-				s.recordHealth(r.Context(), target.Backend, callErr)
+				s.recordHealth(r.Context(), state.health, target.Backend, callErr)
 				s.logAttempt(requestID, profile, target, started, time.Time{}, 0, index > 0, round, callErr)
 				if moreAttempts {
 					continue
@@ -223,11 +239,8 @@ func (s *Server) serveRequest(w http.ResponseWriter, r *http.Request, req *respo
 				cancelAttempt()
 				status, upstreamErr := upstreamError(resp)
 				lastErr = upstreamErr
-				s.recordHealth(r.Context(), target.Backend, upstreamErr)
+				s.recordHealth(r.Context(), state.health, target.Backend, upstreamErr)
 				s.logAttempt(requestID, profile, target, started, time.Time{}, status, index > 0, round, upstreamErr)
-				// While attempts remain, every upstream error status is worth
-				// retrying elsewhere; the strict fallback set only governs the
-				// final reported error.
 				if moreAttempts {
 					continue
 				}
@@ -241,15 +254,14 @@ func (s *Server) serveRequest(w http.ResponseWriter, r *http.Request, req *respo
 					if wrapErr != nil {
 						_ = resp.Body.Close()
 						cancelAttempt()
-						lastErr = wrapErr
-						s.recordHealth(r.Context(), target.Backend, wrapErr)
+						s.recordHealth(r.Context(), state.health, target.Backend, wrapErr)
 						s.logAttempt(requestID, profile, target, started, time.Now(), resp.StatusCode, index > 0, round, wrapErr)
 						writeError(w, http.StatusBadGateway, wrapErr.Error(), requestID)
 						return
 					}
 					resp = converted
 				}
-				s.recordHealth(r.Context(), target.Backend, nil)
+				s.recordHealth(r.Context(), state.health, target.Backend, nil)
 				defer resp.Body.Close()
 				copyHeaders(w.Header(), resp.Header)
 				w.WriteHeader(resp.StatusCode)
@@ -264,8 +276,7 @@ func (s *Server) serveRequest(w http.ResponseWriter, r *http.Request, req *respo
 					_ = resp.Body.Close()
 					stopTimeoutTimer(timer)
 					cancelAttempt()
-					lastErr = wrapErr
-					s.recordHealth(r.Context(), target.Backend, wrapErr)
+					s.recordHealth(r.Context(), state.health, target.Backend, wrapErr)
 					s.logAttempt(requestID, profile, target, started, time.Time{}, resp.StatusCode, index > 0, round, wrapErr)
 					writeError(w, http.StatusBadGateway, wrapErr.Error(), requestID)
 					return
@@ -275,13 +286,12 @@ func (s *Server) serveRequest(w http.ResponseWriter, r *http.Request, req *respo
 			streamResult := s.streamResponse(w, r, resp, requestID, profile, target, started, index > 0, round, func() { stopTimeoutTimer(timer) })
 			stopTimeoutTimer(timer)
 			cancelAttempt()
-			s.recordHealth(r.Context(), target.Backend, streamResult.err)
+			s.recordHealth(r.Context(), state.health, target.Backend, streamResult.err)
 			if streamResult.err != nil && !streamResult.wrote {
 				timedOut = timedOut || attemptTimedOut(attemptCtx, r.Context(), target.Timeout)
 				lastErr = streamResult.err
 			}
 			if !streamResult.wrote && streamResult.err != nil && moreAttempts && r.Context().Err() == nil {
-				// No event reached the client, so this is still a safe pre-generation retry.
 				continue
 			}
 			if streamResult.err != nil && !streamResult.wrote && r.Context().Err() == nil {
@@ -381,9 +391,6 @@ func (s *Server) streamResponse(w http.ResponseWriter, r *http.Request, resp *ht
 			return streamResult{wrote: wrote}
 		}
 		if errors.Is(err, io.EOF) && wrote {
-			// A plain EOF after events were forwarded is how many upstreams
-			// terminate a Responses SSE stream; it is a clean end, not a
-			// backend failure, so it must not poison backend health.
 			s.logAttempt(requestID, profile, target, started, firstToken, resp.StatusCode, fallback, round, nil)
 			return streamResult{wrote: wrote}
 		}
@@ -398,8 +405,6 @@ func (s *Server) streamResponse(w http.ResponseWriter, r *http.Request, resp *ht
 		if firstToken.IsZero() {
 			if meaningfulEvent(event.Type, event.Data) {
 				firstToken = time.Now()
-				// The model is producing output; a late timeout must not kill a
-				// healthy generation that can no longer be replayed elsewhere.
 				stopTimeout()
 			}
 		}
@@ -413,11 +418,11 @@ func (s *Server) streamResponse(w http.ResponseWriter, r *http.Request, resp *ht
 	}
 }
 
-func (s *Server) recordHealth(ctx context.Context, backend string, err error) {
+func (s *Server) recordHealth(ctx context.Context, registry *health.Registry, backend string, err error) {
 	if err != nil && ctx.Err() != nil {
 		return
 	}
-	s.Health.Set(backend, err)
+	registry.Set(backend, err)
 }
 
 func meaningfulEvent(eventType, data string) bool {
@@ -488,35 +493,30 @@ func copyHeaders(dst, src http.Header) {
 	}
 }
 
-type contextKey string
-
-const requestIDKey contextKey = "request-id"
-
 func requestIDMiddleware(logger *slog.Logger, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		id := r.Header.Get("X-Request-ID")
-		if id == "" {
-			id = newRequestID()
+		requestID := r.Header.Get("X-Request-ID")
+		if requestID == "" {
+			requestID = newRequestID()
 		}
-		ctx := context.WithValue(r.Context(), requestIDKey, id)
-		w.Header().Set("X-Request-ID", id)
+		ctx := context.WithValue(r.Context(), requestIDKey{}, requestID)
 		next.ServeHTTP(w, r.WithContext(ctx))
 	})
 }
 
+type requestIDKey struct{}
+
 func requestIDFromContext(ctx context.Context) string {
-	if value, ok := ctx.Value(requestIDKey).(string); ok {
-		return value
-	}
-	return "unknown"
+	requestID, _ := ctx.Value(requestIDKey{}).(string)
+	return requestID
 }
 
 func newRequestID() string {
-	data := make([]byte, 12)
-	if _, err := rand.Read(data); err != nil {
+	var value [16]byte
+	if _, err := rand.Read(value[:]); err != nil {
 		return fmt.Sprintf("%d", time.Now().UnixNano())
 	}
-	return hex.EncodeToString(data)
+	return hex.EncodeToString(value[:])
 }
 
 func writeJSON(w http.ResponseWriter, status int, value any) {
@@ -526,5 +526,5 @@ func writeJSON(w http.ResponseWriter, status int, value any) {
 }
 
 func writeError(w http.ResponseWriter, status int, message, requestID string) {
-	writeJSON(w, status, map[string]any{"error": map[string]any{"type": "cxhub_error", "message": message, "code": status, "request_id": requestID}})
+	writeJSON(w, status, map[string]any{"error": map[string]string{"message": message}, "request_id": requestID})
 }

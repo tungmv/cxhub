@@ -39,6 +39,9 @@ Validate and run:
 
 The default listener is `127.0.0.1:8787`. `cxhub start` runs in the foreground and
 records a private PID file; `cxhub stop` sends SIGTERM to that identified process.
+While running, cxhub checks the config file every second and applies valid backend
+and profile changes without dropping in-flight requests. Invalid configs are
+rejected; changing the gateway address still requires a restart.
 
 ## Codex setup
 

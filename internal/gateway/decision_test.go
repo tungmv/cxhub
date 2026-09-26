@@ -81,28 +81,26 @@ func (f fixedDecision) Score(context.Context, string) (decisionScores, error) {
 }
 
 func TestAutomaticRoutePicksTierAndEffort(t *testing.T) {
-	s := &Server{
-		Config: &config.Config{
-			Decision: config.DecisionConfig{DefaultProfile: "default"},
-			Profiles: map[string]config.ProfileConfig{
-				"fast":    {AutoTier: "speed"},
-				"default": {AutoTier: "balanced"},
-				"strong":  {AutoTier: "quality"},
-			},
+	cfg := &config.Config{
+		Decision: config.DecisionConfig{DefaultProfile: "default"},
+		Profiles: map[string]config.ProfileConfig{
+			"fast":    {AutoTier: "speed"},
+			"default": {AutoTier: "balanced"},
+			"strong":  {AutoTier: "quality"},
 		},
-		Decider: fixedDecision{Speed: .84, Quality: .03, HighEffort: .02},
-		Logger:  slog.New(slog.NewTextHandler(io.Discard, nil)),
 	}
+	state := &runtimeState{config: cfg, decider: fixedDecision{Speed: .84, Quality: .03, HighEffort: .02}}
+	s := &Server{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))}
 	req, _ := responses.Parse([]byte(`{"model":"auto","input":"What is 2+2?"}`))
-	profile, effort, _, err := s.automaticRoute(context.Background(), req)
+	profile, effort, _, err := s.automaticRoute(context.Background(), state, req)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if profile != "fast" || effort != "low" {
 		t.Fatalf("route = %q/%q", profile, effort)
 	}
-	s.Decider = fixedDecision{Speed: .1, Quality: .9, HighEffort: .85}
-	profile, effort, _, err = s.automaticRoute(context.Background(), req)
+	state.decider = fixedDecision{Speed: .1, Quality: .9, HighEffort: .85}
+	profile, effort, _, err = s.automaticRoute(context.Background(), state, req)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -139,7 +137,7 @@ func TestAutoRequestUsesChosenProfileAndEffort(t *testing.T) {
 	}
 	backendProvider := provider.NewOpenAICompatible("one", backend, upstream.Client())
 	s := NewServer(cfg, map[string]provider.Provider{"one": backendProvider}, slog.New(slog.NewTextHandler(io.Discard, nil)))
-	s.Decider = fixedDecision{Speed: .9, Quality: .05, HighEffort: .03}
+	s.state.Load().decider = fixedDecision{Speed: .9, Quality: .05, HighEffort: .03}
 	server := httptest.NewServer(s.Handler())
 	defer server.Close()
 	resp, err := http.Post(server.URL+"/v1/responses", "application/json", strings.NewReader(`{"model":"auto","input":"What is 2+2?","reasoning":{"summary":"auto"}}`))

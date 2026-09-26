@@ -16,7 +16,20 @@ import (
 
 	"cxhub/internal/config"
 	"cxhub/internal/provider"
+	"cxhub/internal/responses"
 )
+
+type fakeProvider struct {
+	id string
+}
+
+func (p *fakeProvider) ID() string { return p.id }
+
+func (p *fakeProvider) Responses(context.Context, *responses.Request, string) (*http.Response, error) {
+	return nil, fmt.Errorf("not implemented")
+}
+
+func (p *fakeProvider) Health(context.Context) error { return nil }
 
 type fakeUpstream struct {
 	mu        sync.Mutex
@@ -112,6 +125,39 @@ func newTestGateway(t *testing.T, backends map[string]*fakeUpstream, profiles ma
 	server := httptest.NewServer(NewServer(cfg, providers, slog.New(slog.NewTextHandler(io.Discard, nil))).Handler())
 	t.Cleanup(server.Close)
 	return server, backends
+}
+
+func TestUpdateConfigReplacesProfiles(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	backend := config.BackendConfig{Type: "openai-compatible", BaseURL: "http://localhost/v1"}
+	providers := map[string]provider.Provider{"one": &fakeProvider{id: "one"}}
+	initial := &config.Config{
+		Backends: map[string]config.BackendConfig{"one": backend},
+		Profiles: map[string]config.ProfileConfig{"old": {Targets: []config.TargetConfig{{Backend: "one", Model: "old-model"}}}},
+	}
+	server := NewServer(initial, providers, logger)
+	updated := &config.Config{
+		Backends: map[string]config.BackendConfig{"one": backend},
+		Profiles: map[string]config.ProfileConfig{"new": {Targets: []config.TargetConfig{{Backend: "one", Model: "new-model"}}}},
+	}
+	if err := server.UpdateConfig(updated, providers); err != nil {
+		t.Fatal(err)
+	}
+	changedAddress := &config.Config{
+		Gateway: config.GatewayConfig{Port: 8788}, Backends: map[string]config.BackendConfig{"one": backend},
+		Profiles: map[string]config.ProfileConfig{"wrong": {Targets: []config.TargetConfig{{Backend: "one", Model: "wrong-model"}}}},
+	}
+	if err := server.UpdateConfig(changedAddress, providers); err == nil {
+		t.Fatal("expected gateway address change to require restart")
+	}
+	response := httptest.NewRecorder()
+	server.Handler().ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/v1/models", nil))
+	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), `"new"`) || strings.Contains(response.Body.String(), `"old"`) {
+		t.Fatalf("models after update = %d %s", response.Code, response.Body.String())
+	}
+	if server.state.Load().config != updated {
+		t.Fatal("rejected config replaced the active runtime state")
+	}
 }
 
 func TestConcurrentFanoutIsolation(t *testing.T) {
@@ -538,7 +584,7 @@ func TestStreamEndsWithPlainEOFKeepsBackendHealthy(t *testing.T) {
 	if !strings.Contains(string(body), "response.output_text.delta") {
 		t.Fatalf("stream did not forward delta events: %q", string(body))
 	}
-	state := srv.Health.Snapshot()["a"]
+	state := srv.state.Load().health.Snapshot()["a"]
 	if !state.Healthy {
 		t.Fatalf("backend marked unhealthy after clean EOF-terminated stream: %q", state.LastError)
 	}
@@ -590,7 +636,7 @@ func TestAnthropicMessagesStreamEndToEnd(t *testing.T) {
 	if !strings.Contains(string(raw), `"model":"orchestrator"`) {
 		t.Fatalf("profile not echoed: %s", raw)
 	}
-	state := srv.Health.Snapshot()["a"]
+	state := srv.state.Load().health.Snapshot()["a"]
 	if !state.Healthy {
 		t.Fatalf("backend marked unhealthy after translated stream: %q", state.LastError)
 	}

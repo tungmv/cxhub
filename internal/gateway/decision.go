@@ -108,11 +108,11 @@ func (d *spanDecision) Score(ctx context.Context, task string) (decisionScores, 
 	return scores, nil
 }
 
-func (s *Server) automaticRoute(ctx context.Context, req *responses.Request) (string, string, decisionScores, error) {
-	if s.Decider == nil {
+func (s *Server) automaticRoute(ctx context.Context, state *runtimeState, req *responses.Request) (string, string, decisionScores, error) {
+	if state.decider == nil {
 		return "", "", decisionScores{}, fmt.Errorf("automatic routing is not configured")
 	}
-	scores, err := s.Decider.Score(ctx, decisionText(req))
+	scores, err := state.decider.Score(ctx, decisionText(req))
 	if err != nil {
 		return "", "", scores, err
 	}
@@ -124,14 +124,14 @@ func (s *Server) automaticRoute(ctx context.Context, req *responses.Request) (st
 		tier = "speed"
 	}
 	profile := ""
-	for name, definition := range s.Config.Profiles {
+	for name, definition := range state.config.Profiles {
 		if definition.AutoTier == tier {
 			profile = name
 			break
 		}
 	}
 	if profile == "" && tier != "balanced" {
-		for name, definition := range s.Config.Profiles {
+		for name, definition := range state.config.Profiles {
 			if definition.AutoTier == "balanced" {
 				profile = name
 				break
@@ -139,7 +139,7 @@ func (s *Server) automaticRoute(ctx context.Context, req *responses.Request) (st
 		}
 	}
 	if profile == "" {
-		profile = s.Config.Decision.DefaultProfile
+		profile = state.config.Decision.DefaultProfile
 	}
 	effort := "medium"
 	if scores.HighEffort >= 0.6 || scores.Quality >= 0.6 {

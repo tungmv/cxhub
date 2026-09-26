@@ -98,6 +98,22 @@ func newTestGateway(t *testing.T, backends map[string]*fakeUpstream, profiles ma
 	return server, backends
 }
 
+func TestUpdateConfigReplacesProfiles(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	server := NewServer(&config.Config{Profiles: map[string]config.ProfileConfig{"old": {Targets: []config.TargetConfig{{Backend: "a", Model: "old-model"}}}}}, nil, logger)
+	if err := server.UpdateConfig(&config.Config{Profiles: map[string]config.ProfileConfig{"new": {Targets: []config.TargetConfig{{Backend: "b", Model: "new-model"}}}}}, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := server.UpdateConfig(&config.Config{Gateway: config.GatewayConfig{Port: 8788}, Profiles: map[string]config.ProfileConfig{"wrong": {Targets: []config.TargetConfig{{Backend: "b", Model: "wrong-model"}}}}}, nil); err == nil {
+		t.Fatal("expected gateway address change to require restart")
+	}
+	response := httptest.NewRecorder()
+	server.Handler().ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/v1/models", nil))
+	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), `"new"`) || strings.Contains(response.Body.String(), `"old"`) {
+		t.Fatalf("models after update = %d %s", response.Code, response.Body.String())
+	}
+}
+
 func TestConcurrentFanoutIsolation(t *testing.T) {
 	backends := map[string]*fakeUpstream{
 		"a": {delay: 20 * time.Millisecond, events: []string{event("response.output_text.delta", `{"delta":"a"}`), "data: [DONE]\n\n"}},

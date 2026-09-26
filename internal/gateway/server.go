@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"net/http"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"cxhub/internal/config"
@@ -22,12 +23,15 @@ import (
 )
 
 type Server struct {
-	Config    *config.Config
-	Router    *routing.Router
-	Providers map[string]provider.Provider
-	Health    *health.Registry
-	Logger    *slog.Logger
-	HTTP      *http.Server
+	state  atomic.Pointer[runtimeState]
+	Logger *slog.Logger
+	HTTP   *http.Server
+}
+
+type runtimeState struct {
+	config *config.Config
+	router *routing.Router
+	health *health.Registry
 }
 
 func NewServer(cfg *config.Config, providers map[string]provider.Provider, logger *slog.Logger) *Server {
@@ -38,7 +42,24 @@ func NewServer(cfg *config.Config, providers map[string]provider.Provider, logge
 	for name := range providers {
 		names = append(names, name)
 	}
-	return &Server{Config: cfg, Router: routing.New(cfg, providers), Providers: providers, Health: health.New(names), Logger: logger}
+	s := &Server{Logger: logger}
+	s.state.Store(&runtimeState{config: cfg, router: routing.New(cfg, providers), health: health.New(names)})
+	return s
+}
+
+// UpdateConfig atomically applies a validated config without interrupting in-flight requests.
+func (s *Server) UpdateConfig(cfg *config.Config, providers map[string]provider.Provider) error {
+	// Gateway address changes need a listener restart, so do not publish a
+	// config that would make /status report a different address than we serve.
+	if cfg.Address() != s.state.Load().config.Address() {
+		return fmt.Errorf("gateway address changes require restart")
+	}
+	names := make([]string, 0, len(providers))
+	for name := range providers {
+		names = append(names, name)
+	}
+	s.state.Store(&runtimeState{config: cfg, router: routing.New(cfg, providers), health: health.New(names)})
+	return nil
 }
 
 func (s *Server) Handler() http.Handler {
@@ -51,7 +72,7 @@ func (s *Server) Handler() http.Handler {
 }
 
 func (s *Server) Start() error {
-	s.HTTP = &http.Server{Addr: s.Config.Address(), Handler: s.Handler(), ReadHeaderTimeout: 10 * time.Second, IdleTimeout: 90 * time.Second}
+	s.HTTP = &http.Server{Addr: s.state.Load().config.Address(), Handler: s.Handler(), ReadHeaderTimeout: 10 * time.Second, IdleTimeout: 90 * time.Second}
 	return s.HTTP.ListenAndServe()
 }
 
@@ -67,17 +88,19 @@ func (s *Server) handleHealth(w http.ResponseWriter, _ *http.Request) {
 }
 
 func (s *Server) handleModels(w http.ResponseWriter, _ *http.Request) {
-	data := make([]map[string]any, 0, len(s.Router.Profiles()))
-	for _, profile := range s.Router.Profiles() {
+	state := s.state.Load()
+	data := make([]map[string]any, 0, len(state.router.Profiles()))
+	for _, profile := range state.router.Profiles() {
 		data = append(data, map[string]any{"id": profile, "object": "model", "owned_by": "cxhub"})
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"object": "list", "data": data})
 }
 
 func (s *Server) handleStatus(w http.ResponseWriter, _ *http.Request) {
-	backendStates := s.Health.Snapshot()
-	profileStatus := make(map[string][]map[string]any, len(s.Config.Profiles))
-	for profile, definition := range s.Config.Profiles {
+	state := s.state.Load()
+	backendStates := state.health.Snapshot()
+	profileStatus := make(map[string][]map[string]any, len(state.config.Profiles))
+	for profile, definition := range state.config.Profiles {
 		for _, target := range definition.Targets {
 			state := backendStates[target.Backend]
 			profileStatus[profile] = append(profileStatus[profile], map[string]any{
@@ -90,7 +113,7 @@ func (s *Server) handleStatus(w http.ResponseWriter, _ *http.Request) {
 		}
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"gateway":  map[string]any{"address": s.Config.Address(), "status": "ok"},
+		"gateway":  map[string]any{"address": s.state.Load().config.Address(), "status": "ok"},
 		"backends": backendStates,
 		"profiles": profileStatus,
 	})
@@ -122,7 +145,8 @@ func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "model is required and must be a configured logical profile", requestID)
 		return
 	}
-	targets, err := s.Router.Resolve(profile)
+	state := s.state.Load()
+	targets, err := state.router.Resolve(profile)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err.Error(), requestID)
 		return
@@ -134,7 +158,7 @@ func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
 	for index, target := range targets {
 		resp, callErr := target.Provider.Responses(r.Context(), req, target.Model)
 		if callErr != nil {
-			s.recordHealth(r.Context(), target.Backend, callErr)
+			recordHealth(r.Context(), state.health, target.Backend, callErr)
 			s.logAttempt(requestID, profile, target, started, time.Time{}, 0, index > 0, callErr)
 			if index+1 < len(targets) {
 				continue
@@ -144,7 +168,7 @@ func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
 		}
 		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 			status, upstreamErr := upstreamError(resp)
-			s.recordHealth(r.Context(), target.Backend, upstreamErr)
+			recordHealth(r.Context(), state.health, target.Backend, upstreamErr)
 			s.logAttempt(requestID, profile, target, started, time.Time{}, status, index > 0, upstreamErr)
 			if shouldFallback(status) && index+1 < len(targets) {
 				continue
@@ -153,7 +177,7 @@ func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if !req.Stream {
-			s.recordHealth(r.Context(), target.Backend, nil)
+			recordHealth(r.Context(), state.health, target.Backend, nil)
 			defer resp.Body.Close()
 			copyHeaders(w.Header(), resp.Header)
 			w.WriteHeader(resp.StatusCode)
@@ -162,7 +186,7 @@ func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		streamResult := s.streamResponse(w, r, resp, requestID, profile, target, started, index > 0)
-		s.recordHealth(r.Context(), target.Backend, streamResult.err)
+		recordHealth(r.Context(), state.health, target.Backend, streamResult.err)
 		if !streamResult.wrote && streamResult.err != nil && index+1 < len(targets) && r.Context().Err() == nil {
 			// No event reached the client, so this is still a safe pre-generation retry.
 			continue
@@ -231,11 +255,11 @@ func (s *Server) streamResponse(w http.ResponseWriter, r *http.Request, resp *ht
 	}
 }
 
-func (s *Server) recordHealth(ctx context.Context, backend string, err error) {
+func recordHealth(ctx context.Context, registry *health.Registry, backend string, err error) {
 	if err != nil && ctx.Err() != nil {
 		return
 	}
-	s.Health.Set(backend, err)
+	registry.Set(backend, err)
 }
 
 func meaningfulEvent(eventType, data string) bool {

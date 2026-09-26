@@ -144,6 +144,7 @@ func startCommand(args []string) error {
 	}()
 	serverErr := make(chan error, 1)
 	go func() { serverErr <- server.Start() }()
+	go watchConfig(*path, server, logger)
 	fmt.Printf("cxhub listening on http://%s\n", cfg.Address())
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -157,6 +158,45 @@ func startCommand(args []string) error {
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
 		return server.Shutdown(shutdownCtx)
+	}
+}
+
+func watchConfig(path string, server *gateway.Server, logger *slog.Logger) {
+	var modTime time.Time
+	var size int64 = -1
+	if info, err := os.Stat(path); err == nil {
+		modTime, size = info.ModTime(), info.Size()
+	}
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+	for range ticker.C {
+		info, err := os.Stat(path)
+		if err != nil {
+			continue
+		}
+		if info.ModTime() == modTime && info.Size() == size {
+			continue
+		}
+		modTime, size = info.ModTime(), info.Size()
+		cfg, err := config.Load(path)
+		if err != nil {
+			logger.Error("config reload rejected", "error", err)
+			continue
+		}
+		providers := make(map[string]provider.Provider, len(cfg.Backends))
+		for name, backend := range cfg.Backends {
+			client := provider.DefaultHTTPClient(cfg.RequestTimeoutDuration())
+			if backend.Type == "openai-chat-compatible" {
+				providers[name] = provider.NewOpenAIChatCompatible(name, backend, client)
+			} else {
+				providers[name] = provider.NewOpenAICompatible(name, backend, client)
+			}
+		}
+		if err := server.UpdateConfig(cfg, providers); err != nil {
+			logger.Error("config reload rejected", "error", err)
+			continue
+		}
+		logger.Info("config reloaded")
 	}
 }
 

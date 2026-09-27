@@ -82,7 +82,8 @@
       "tool_mode": "code_mode_only",
       "multi_agent_version": "v2",
       "multi_agent_reasoning_effort": "xhigh",
-      "base_instructions": ""
+      "base_instructions": "",
+      "supports_reasoning_effort_updates": true
     },
     {
       "slug": "orchestrator",
@@ -166,7 +167,8 @@
       "tool_mode": "code_mode_only",
       "multi_agent_version": "v2",
       "multi_agent_reasoning_effort": "xhigh",
-      "base_instructions": ""
+      "base_instructions": "",
+      "supports_reasoning_effort_updates": true
     }
   ]
 }

@@ -17,7 +17,7 @@ go build ./cmd/cxhub
 
 ## Configure
 
-Start from [configs/example.yaml](/Users/tony/build/cxhub/configs/example.yaml):
+Start from [configs/example.yaml](configs/example.yaml):
 
 ```sh
 mkdir -p ~/.config/cxhub
@@ -68,7 +68,7 @@ window and supported reasoning levels used by the local profile.
 
 `cxhub init` only creates its own YAML example and deliberately does not rewrite the
 existing Codex TOML automatically. The installed Codex CLI was inspected in
-[docs/codex-integration.md](/Users/tony/build/cxhub/docs/codex-integration.md).
+[docs/codex-integration.md](docs/codex-integration.md).
 
 ## Claude Code setup
 
@@ -108,8 +108,8 @@ the request (ordered by `priority`); each target can also set a `timeout` that
 triggers fallback when an upstream stalls before producing output, and a profile
 can declare `retries`/`retry_backoff` to make a critical profile such as the
 orchestrator practically never fail. See
-[docs/routing.md](/Users/tony/build/cxhub/docs/routing.md) and
-[docs/architecture.md](/Users/tony/build/cxhub/docs/architecture.md).
+[docs/routing.md](docs/routing.md) and
+[docs/architecture.md](docs/architecture.md).
 
 For automatic routing, set `decision.backend`, `decision.model`, and
 `decision.default_profile`; set `auto_tier: speed|balanced|quality` on at most one

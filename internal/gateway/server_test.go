@@ -15,8 +15,10 @@ import (
 	"time"
 
 	"cxhub/internal/config"
+	"cxhub/internal/health"
 	"cxhub/internal/provider"
 	"cxhub/internal/responses"
+	"cxhub/internal/routing"
 )
 
 type fakeProvider struct {
@@ -283,6 +285,30 @@ func TestFallbackWhenStreamEndsBeforeFirstEvent(t *testing.T) {
 	body, _ := io.ReadAll(response.Body)
 	if response.StatusCode != http.StatusOK || !strings.Contains(string(body), `"delta":"recovered"`) {
 		t.Fatalf("stream fallback failed: status=%d body=%s", response.StatusCode, body)
+	}
+}
+
+func TestPreferHealthyOrdersFailingBackendLast(t *testing.T) {
+	targets := []routing.Target{
+		{Backend: "flaky", Model: "a"},
+		{Backend: "steady", Model: "b"},
+		{Backend: "dead", Model: "c"},
+	}
+	backends := map[string]health.Backend{
+		"flaky":  {Failures: 1},
+		"steady": {Failures: 0},
+		"dead":   {Failures: 7},
+	}
+	order := []string{}
+	for _, target := range preferHealthy(backends, targets) {
+		order = append(order, target.Backend)
+	}
+	if strings.Join(order, ",") != "steady,flaky,dead" {
+		t.Fatalf("expected healthy-first ordering, got %v", order)
+	}
+	// A failing backend must stay reachable, never be dropped.
+	if len(preferHealthy(backends, targets)) != len(targets) {
+		t.Fatal("preferHealthy dropped a target")
 	}
 }
 

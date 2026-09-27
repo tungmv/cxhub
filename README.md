@@ -112,9 +112,10 @@ orchestrator practically never fail. See
 [docs/architecture.md](docs/architecture.md).
 
 For automatic routing, set `decision.backend`, `decision.model`, and
-`decision.default_profile`; set `auto_tier: speed|balanced|quality` on at most one
-profile per tier. Codex can then use `model = "auto"` (including in custom agent
-TOML files). The selector scores only request text using OpenRouter's
+`decision.default_profile`; `decision.candidates` lists the logical models the
+selector may choose from (omit it to let every profile compete). Codex can then use
+`model = "auto"` (including in custom agent TOML files). The selector scores only
+request text using OpenRouter's
 [Decisions API](https://openrouter.ai/docs/api/api-reference/alphadecisions/submit-a-decisions-request).
 It sends user text to OpenRouter; image/audio contents are not sent. If selection
 fails, cxhub uses `default_profile` with medium reasoning effort. Explicit named

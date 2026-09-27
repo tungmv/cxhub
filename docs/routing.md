@@ -15,29 +15,30 @@ never advertised through `/v1/models`.
 When decision routing is configured, `model: auto` is advertised as an additional
 logical model. cxhub sends the request's user text to OpenRouter's
 [Decisions API](https://openrouter.ai/docs/api/api-reference/alphadecisions/submit-a-decisions-request)
-using `respan/span-01-lite`, then uses the returned speed/quality scores to pick
-one `auto_tier` profile and a `low`, `medium`, or `high` reasoning effort. Image
-and audio payloads are not included in the decision request. Configure one profile
-per tier; ordinary profile names route unchanged.
+using `respan/span-01-lite`. The request asks one `noul` question per candidate
+model ("is model X the best choice?"), plus two effort questions. The highest
+scoring candidate wins — ties resolve to the first candidate in name order — and
+the effort answers pick a `low`, `medium`, or `high` reasoning effort. Image and
+audio payloads are not included in the decision request. Ordinary profile names
+route unchanged.
 
-The selector is deliberately constrained to profiles already configured in cxhub:
+`decision.candidates` lists the models selection may choose from; omit it and
+every profile competes. Keep it short: each entry costs one question per request.
 
 ```yaml
 decision:
   backend: openrouter
   model: respan/span-01-lite
   default_profile: orchestrator
+  candidates: [fast, orchestrator, reviewer]
   timeout: 2s
 
 profiles:
   fast:
-    auto_tier: speed
     targets: [{backend: openrouter, model: YOUR_FAST_MODEL}]
   orchestrator:
-    auto_tier: balanced
     targets: [{backend: cliproxy, model: YOUR_DEFAULT_MODEL}]
   reviewer:
-    auto_tier: quality
     targets: [{backend: openrouter, model: YOUR_STRONG_MODEL}]
 ```
 

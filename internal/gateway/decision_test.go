@@ -35,12 +35,20 @@ func TestSpanDecisionUsesOpenRouterDecisionsAPI(t *testing.T) {
 			t.Error(err)
 			return
 		}
-		if payload.Model != "respan/span-01-lite" || len(payload.Questions) != 3 {
+		if payload.Model != "respan/span-01-lite" || len(payload.Questions) != 4 {
 			t.Errorf("model/questions = %q/%d", payload.Model, len(payload.Questions))
 		}
 		for name, question := range payload.Questions {
 			if question.Type != "noul" {
 				t.Errorf("question %q type = %q", name, question.Type)
+			}
+			if name != "high_effort" && name != "low_effort" && !strings.HasPrefix(name, modelQuestionPrefix) {
+				t.Errorf("unexpected question %q", name)
+			}
+		}
+		for _, candidate := range []string{"fast", "default"} {
+			if _, ok := payload.Questions[modelQuestionPrefix+candidate]; !ok {
+				t.Errorf("missing question for candidate %q", candidate)
 			}
 		}
 		var state struct {
@@ -61,35 +69,31 @@ func TestSpanDecisionUsesOpenRouterDecisionsAPI(t *testing.T) {
 		if len(state.Input) != 1 || state.Input[0].Role != "user" || state.Input[0].Content != "Fix the login race." || state.Output.Role != "assistant" {
 			t.Errorf("unexpected decision state: %+v", state)
 		}
-		_, _ = io.WriteString(w, `{"answers":{"speed":{"type":"noul","noul":0.8},"quality":{"type":"noul","noul":0.1},"high_effort":{"type":"noul","noul":0.2}}}`)
+		_, _ = io.WriteString(w, `{"answers":{"model:fast":{"type":"noul","noul":0.8},"model:default":{"type":"noul","noul":0.1},"high_effort":{"type":"noul","noul":0.2},"low_effort":{"type":"noul","noul":0.9}}}`)
 	}))
 	defer server.Close()
 	decider := &spanDecision{model: "respan/span-01-lite", apiKey: "test-key", endpoint: server.URL + "/api/alpha/decisions", client: server.Client()}
-	scores, err := decider.Score(context.Background(), "Fix the login race.")
+	scores, err := decider.Score(context.Background(), "Fix the login race.", []string{"default", "fast"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if scores.Speed != .8 || scores.Quality != .1 || scores.HighEffort != .2 {
+	if scores.Models["fast"] != .8 || scores.Models["default"] != .1 || scores.HighEffort != .2 || scores.LowEffort != .9 {
 		t.Fatalf("scores = %+v", scores)
 	}
 }
 
 type fixedDecision decisionScores
 
-func (f fixedDecision) Score(context.Context, string) (decisionScores, error) {
+func (f fixedDecision) Score(context.Context, string, []string) (decisionScores, error) {
 	return decisionScores(f), nil
 }
 
-func TestAutomaticRoutePicksTierAndEffort(t *testing.T) {
+func TestAutomaticRoutePicksCandidateAndEffort(t *testing.T) {
 	cfg := &config.Config{
-		Decision: config.DecisionConfig{DefaultProfile: "default"},
-		Profiles: map[string]config.ProfileConfig{
-			"fast":    {AutoTier: "speed"},
-			"default": {AutoTier: "balanced"},
-			"strong":  {AutoTier: "quality"},
-		},
+		Decision: config.DecisionConfig{DefaultProfile: "default", Candidates: []string{"fast", "default", "strong"}},
+		Profiles: map[string]config.ProfileConfig{"fast": {}, "default": {}, "strong": {}},
 	}
-	state := &runtimeState{config: cfg, decider: fixedDecision{Speed: .84, Quality: .03, HighEffort: .02}}
+	state := &runtimeState{config: cfg, decider: fixedDecision{Models: map[string]float64{"fast": .84, "default": .5, "strong": .1}, LowEffort: .9}}
 	s := &Server{Logger: slog.New(slog.NewTextHandler(io.Discard, nil))}
 	req, _ := responses.Parse([]byte(`{"model":"auto","input":"What is 2+2?"}`))
 	profile, effort, _, err := s.automaticRoute(context.Background(), state, req)
@@ -99,13 +103,22 @@ func TestAutomaticRoutePicksTierAndEffort(t *testing.T) {
 	if profile != "fast" || effort != "low" {
 		t.Fatalf("route = %q/%q", profile, effort)
 	}
-	state.decider = fixedDecision{Speed: .1, Quality: .9, HighEffort: .85}
+	state.decider = fixedDecision{Models: map[string]float64{"fast": .1, "default": .2, "strong": .9}, HighEffort: .85}
 	profile, effort, _, err = s.automaticRoute(context.Background(), state, req)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if profile != "strong" || effort != "high" {
 		t.Fatalf("route = %q/%q", profile, effort)
+	}
+	// Ties resolve to the first candidate in sorted order so selection is deterministic.
+	state.decider = fixedDecision{Models: map[string]float64{"fast": .7, "default": .7, "strong": .7}}
+	profile, effort, _, err = s.automaticRoute(context.Background(), state, req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if profile != "default" || effort != "medium" {
+		t.Fatalf("tie route = %q/%q", profile, effort)
 	}
 }
 
@@ -130,14 +143,14 @@ func TestAutoRequestUsesChosenProfileAndEffort(t *testing.T) {
 	cfg := &config.Config{
 		Backends: map[string]config.BackendConfig{"one": backend},
 		Profiles: map[string]config.ProfileConfig{
-			"fast":    {AutoTier: "speed", Targets: []config.TargetConfig{{Backend: "one", Model: "fast-model"}}},
-			"default": {AutoTier: "balanced", Targets: []config.TargetConfig{{Backend: "one", Model: "default-model"}}},
+			"fast":    {Targets: []config.TargetConfig{{Backend: "one", Model: "fast-model"}}},
+			"default": {Targets: []config.TargetConfig{{Backend: "one", Model: "default-model"}}},
 		},
-		Decision: config.DecisionConfig{DefaultProfile: "default"},
+		Decision: config.DecisionConfig{DefaultProfile: "default", Candidates: []string{"default", "fast"}},
 	}
 	backendProvider := provider.NewOpenAICompatible("one", backend, upstream.Client())
 	s := NewServer(cfg, map[string]provider.Provider{"one": backendProvider}, slog.New(slog.NewTextHandler(io.Discard, nil)))
-	s.state.Load().decider = fixedDecision{Speed: .9, Quality: .05, HighEffort: .03}
+	s.state.Load().decider = fixedDecision{Models: map[string]float64{"fast": .9, "default": .05}, LowEffort: .9}
 	server := httptest.NewServer(s.Handler())
 	defer server.Close()
 	resp, err := http.Post(server.URL+"/v1/responses", "application/json", strings.NewReader(`{"model":"auto","input":"What is 2+2?","reasoning":{"summary":"auto"}}`))

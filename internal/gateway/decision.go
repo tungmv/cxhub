@@ -15,14 +15,16 @@ import (
 
 const openRouterDecisionsURL = "https://openrouter.ai/api/alpha/decisions"
 
+// decisionScores holds one noul score per candidate model plus the two
+// reasoning-effort answers.
 type decisionScores struct {
-	Speed      float64
-	Quality    float64
+	Models     map[string]float64
 	HighEffort float64
+	LowEffort  float64
 }
 
 type decisionScorer interface {
-	Score(context.Context, string) (decisionScores, error)
+	Score(context.Context, string, []string) (decisionScores, error)
 }
 
 type spanDecision struct {
@@ -41,9 +43,26 @@ func newSpanDecision(cfg config.DecisionConfig, backend config.BackendConfig) *s
 	}
 }
 
-func (d *spanDecision) Score(ctx context.Context, task string) (decisionScores, error) {
+// modelQuestionPrefix keeps per-model answers addressable in the flat answer
+// map without colliding with the effort questions.
+const modelQuestionPrefix = "model:"
+
+func (d *spanDecision) Score(ctx context.Context, task string, candidates []string) (decisionScores, error) {
 	if strings.TrimSpace(task) == "" {
 		return decisionScores{}, fmt.Errorf("request has no text to classify")
+	}
+	if len(candidates) == 0 {
+		return decisionScores{}, fmt.Errorf("automatic routing has no candidate models")
+	}
+	questions := map[string]any{
+		"high_effort": map[string]string{"type": "noul", "instructions": "A high reasoning effort is needed to answer the user request well."},
+		"low_effort":  map[string]string{"type": "noul", "instructions": "The user request can be answered well with little reasoning."},
+	}
+	for _, candidate := range candidates {
+		questions[modelQuestionPrefix+candidate] = map[string]string{
+			"type":         "noul",
+			"instructions": fmt.Sprintf("The %q model is the best choice to answer this user request.", candidate),
+		}
 	}
 	payload := map[string]any{
 		"model": d.model,
@@ -51,11 +70,7 @@ func (d *spanDecision) Score(ctx context.Context, task string) (decisionScores, 
 			"input":  []map[string]string{{"role": "user", "content": task}},
 			"output": map[string]string{"role": "assistant", "content": ""},
 		},
-		"questions": map[string]any{
-			"speed":       map[string]string{"type": "noul", "instructions": "The user request is straightforward, low-risk, and can be handled well by a fast, low-cost model with little reasoning."},
-			"quality":     map[string]string{"type": "noul", "instructions": "The user request is difficult, ambiguous, multi-step, or costly to get wrong, so it benefits from a stronger model."},
-			"high_effort": map[string]string{"type": "noul", "instructions": "A high reasoning effort is needed to answer the user request well."},
-		},
+		"questions": questions,
 	}
 	body, err := json.Marshal(payload)
 	if err != nil {
@@ -96,13 +111,18 @@ func (d *spanDecision) Score(ctx context.Context, task string) (decisionScores, 
 		return answer.Noul, nil
 	}
 	var scores decisionScores
-	if scores.Speed, err = read("speed"); err != nil {
-		return decisionScores{}, err
-	}
-	if scores.Quality, err = read("quality"); err != nil {
-		return decisionScores{}, err
+	scores.Models = make(map[string]float64, len(candidates))
+	for _, candidate := range candidates {
+		score, err := read(modelQuestionPrefix + candidate)
+		if err != nil {
+			return decisionScores{}, err
+		}
+		scores.Models[candidate] = score
 	}
 	if scores.HighEffort, err = read("high_effort"); err != nil {
+		return decisionScores{}, err
+	}
+	if scores.LowEffort, err = read("low_effort"); err != nil {
 		return decisionScores{}, err
 	}
 	return scores, nil
@@ -112,42 +132,29 @@ func (s *Server) automaticRoute(ctx context.Context, state *runtimeState, req *r
 	if state.decider == nil {
 		return "", "", decisionScores{}, fmt.Errorf("automatic routing is not configured")
 	}
-	scores, err := state.decider.Score(ctx, decisionText(req))
+	candidates := state.config.Decision.CandidateProfiles()
+	scores, err := state.decider.Score(ctx, decisionText(req), candidates)
 	if err != nil {
 		return "", "", scores, err
 	}
-	tier := "balanced"
-	// ponytail: fixed score thresholds keep routing deterministic; tune them from observed outcomes if they misclassify tasks.
-	if scores.Quality >= 0.6 && scores.Quality > scores.Speed {
-		tier = "quality"
-	} else if scores.Speed >= 0.6 && scores.Speed > scores.Quality {
-		tier = "speed"
-	}
-	profile := ""
-	for name, definition := range state.config.Profiles {
-		if definition.AutoTier == tier {
-			profile = name
-			break
+	// ponytail: ties resolve to the first candidate in sorted order and effort uses fixed thresholds, so selection stays deterministic; tune from observed outcomes if routing misfires.
+	selected := ""
+	best := -1.0
+	for _, candidate := range candidates {
+		if score := scores.Models[candidate]; selected == "" || score > best {
+			selected, best = candidate, score
 		}
 	}
-	if profile == "" && tier != "balanced" {
-		for name, definition := range state.config.Profiles {
-			if definition.AutoTier == "balanced" {
-				profile = name
-				break
-			}
-		}
-	}
-	if profile == "" {
-		profile = state.config.Decision.DefaultProfile
+	if selected == "" {
+		selected = state.config.Decision.DefaultProfile
 	}
 	effort := "medium"
-	if scores.HighEffort >= 0.6 || scores.Quality >= 0.6 {
+	if scores.HighEffort >= 0.6 {
 		effort = "high"
-	} else if scores.Speed >= 0.75 {
+	} else if scores.LowEffort >= 0.75 {
 		effort = "low"
 	}
-	return profile, effort, scores, nil
+	return selected, effort, scores, nil
 }
 
 func decisionText(req *responses.Request) string {

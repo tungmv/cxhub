@@ -10,6 +10,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"sort"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -116,7 +117,7 @@ func (s *Server) handleStatus(w http.ResponseWriter, _ *http.Request) {
 		for _, target := range definition.Targets {
 			backendState := backendStates[target.Backend]
 			profileStatus[profile] = append(profileStatus[profile], map[string]any{
-				"level": strings.TrimSpace(definition.Level), "auto_tier": definition.AutoTier,
+				"level":    strings.TrimSpace(definition.Level),
 				"priority": definition.Priority, "retries": definition.EffectiveRetries(),
 				"backend": target.Backend, "model": target.Model, "healthy": backendState.Healthy,
 				"last_check": backendState.LastCheck, "last_error": backendState.LastError,
@@ -125,7 +126,7 @@ func (s *Server) handleStatus(w http.ResponseWriter, _ *http.Request) {
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"gateway":  map[string]any{"address": state.config.Address(), "status": "ok"},
-		"decision": map[string]any{"enabled": state.decider != nil, "model": state.config.Decision.Model},
+		"decision": map[string]any{"enabled": state.decider != nil, "model": state.config.Decision.Model, "candidates": state.config.Decision.CandidateProfiles()},
 		"backends": backendStates, "profiles": profileStatus,
 	})
 }
@@ -185,7 +186,7 @@ func (s *Server) serveRequest(w http.ResponseWriter, r *http.Request, req *respo
 			effort = "medium"
 			s.Logger.Warn("automatic route decision failed; using default profile", "request_id", requestID, "profile", selected, "error", err)
 		} else {
-			s.Logger.Info("automatic route selected", "request_id", requestID, "profile", selected, "reasoning_effort", effort, "speed_score", scores.Speed, "quality_score", scores.Quality, "high_effort_score", scores.HighEffort)
+			s.Logger.Info("automatic route selected", "request_id", requestID, "profile", selected, "reasoning_effort", effort, "model_scores", scores.Models, "high_effort_score", scores.HighEffort, "low_effort_score", scores.LowEffort)
 		}
 		if err := req.SetReasoningEffort(effort); err != nil {
 			writeError(w, http.StatusBadRequest, err.Error(), requestID)
@@ -202,6 +203,7 @@ func (s *Server) serveRequest(w http.ResponseWriter, r *http.Request, req *respo
 		writeError(w, http.StatusServiceUnavailable, "profile has no available targets", requestID)
 		return
 	}
+	targets = preferHealthy(state.health.Snapshot(), targets)
 	var lastErr error
 	timedOut := false
 	rounds, backoff := attemptRounds(targets)
@@ -300,6 +302,18 @@ func (s *Server) serveRequest(w http.ResponseWriter, r *http.Request, req *respo
 			return
 		}
 	}
+}
+
+// preferHealthy moves targets whose backend has fewer consecutive failures
+// first, so an unstable provider is tried last instead of first. YAML order is
+// preserved inside a group of equal failure counts, and no target is dropped:
+// a failing backend still serves the request if every healthier one fails.
+func preferHealthy(backends map[string]health.Backend, targets []routing.Target) []routing.Target {
+	ordered := append([]routing.Target(nil), targets...)
+	sort.SliceStable(ordered, func(i, j int) bool {
+		return backends[ordered[i].Backend].Failures < backends[ordered[j].Backend].Failures
+	})
+	return ordered
 }
 
 // attemptRounds returns the retry passes over the target list (at least one)

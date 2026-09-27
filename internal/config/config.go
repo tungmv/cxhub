@@ -17,10 +17,22 @@ type Config struct {
 }
 
 type DecisionConfig struct {
-	Backend        string `yaml:"backend"`
-	Model          string `yaml:"model"`
+	Backend string `yaml:"backend"`
+	Model   string `yaml:"model"`
+	// DefaultProfile routes the request when selection fails.
 	DefaultProfile string `yaml:"default_profile"`
-	Timeout        string `yaml:"timeout"`
+	// Candidates are the logical models selection may choose from. When empty,
+	// every configured profile is a candidate.
+	Candidates []string `yaml:"candidates"`
+	Timeout    string   `yaml:"timeout"`
+}
+
+// CandidateProfiles returns the profiles selection may choose from, sorted by
+// name. Validate defaults empty Candidates to every profile.
+func (d DecisionConfig) CandidateProfiles() []string {
+	result := append([]string(nil), d.Candidates...)
+	sort.Strings(result)
+	return result
 }
 
 func (d DecisionConfig) TimeoutDuration() time.Duration {
@@ -49,8 +61,6 @@ type BackendConfig struct {
 }
 
 type ProfileConfig struct {
-	// AutoTier lets the decision model choose this profile for automatic routing.
-	AutoTier string `yaml:"auto_tier"`
 	// Level groups profiles into a fallback tier. Profiles sharing the same
 	// non-empty level serve as each other's fallback targets.
 	Level string `yaml:"level"`
@@ -218,7 +228,14 @@ func (c *Config) Validate() error {
 		profileNames = append(profileNames, name)
 	}
 	sort.Strings(profileNames)
-	seenAutoTiers := make(map[string]string, 3)
+	if decisionConfigured && len(c.Decision.Candidates) == 0 {
+		c.Decision.Candidates = profileNames
+	}
+	for _, candidate := range c.Decision.Candidates {
+		if _, ok := c.Profiles[candidate]; !ok {
+			return fmt.Errorf("decision.candidates %q does not exist", candidate)
+		}
+	}
 	for _, name := range profileNames {
 		p := c.Profiles[name]
 		if strings.TrimSpace(name) == "" {
@@ -226,17 +243,6 @@ func (c *Config) Validate() error {
 		}
 		if name == "auto" {
 			return fmt.Errorf("profile name %q is reserved for automatic routing", name)
-		}
-		p.AutoTier = strings.TrimSpace(p.AutoTier)
-		if tier := p.AutoTier; tier != "" && tier != "speed" && tier != "balanced" && tier != "quality" {
-			return fmt.Errorf("profile %q has invalid auto_tier %q: must be speed, balanced, or quality", name, p.AutoTier)
-		}
-		c.Profiles[name] = p
-		if decisionConfigured && p.AutoTier != "" {
-			if previous, exists := seenAutoTiers[p.AutoTier]; exists {
-				return fmt.Errorf("profiles %q and %q share auto_tier %q", previous, name, p.AutoTier)
-			}
-			seenAutoTiers[p.AutoTier] = name
 		}
 		if len(p.Targets) == 0 {
 			return fmt.Errorf("profile %q must have at least one target", name)
@@ -270,9 +276,6 @@ func (c *Config) Validate() error {
 				return fmt.Errorf("profile %q has invalid retry_backoff %q: must be a positive Go duration", name, p.RetryBackoff)
 			}
 		}
-	}
-	if decisionConfigured && len(seenAutoTiers) == 0 {
-		return fmt.Errorf("automatic routing requires at least one profile with auto_tier")
 	}
 	return nil
 }

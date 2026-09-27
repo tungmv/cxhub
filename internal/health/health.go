@@ -6,7 +6,11 @@ import (
 )
 
 type Backend struct {
-	Healthy   bool      `json:"healthy"`
+	Healthy bool `json:"healthy"`
+	// Failures is the count of consecutive failed attempts, reset by any
+	// success. Routing orders backends by it, so a single success does not
+	// erase a backend that has been failing.
+	Failures  int       `json:"failures"`
 	LastCheck time.Time `json:"last_check,omitempty"`
 	LastError string    `json:"last_error,omitempty"`
 }
@@ -27,8 +31,12 @@ func New(names []string) *Registry {
 func (r *Registry) Set(name string, err error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	state := Backend{Healthy: err == nil, LastCheck: time.Now().UTC()}
-	if err != nil {
+	previous := r.backends[name]
+	state := Backend{LastCheck: time.Now().UTC()}
+	if err == nil {
+		state.Healthy = true
+	} else {
+		state.Failures = previous.Failures + 1
 		state.LastError = err.Error()
 	}
 	r.backends[name] = state

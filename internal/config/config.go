@@ -104,6 +104,10 @@ type TargetConfig struct {
 	Backend string `yaml:"backend"`
 	Model   string `yaml:"model"`
 	Timeout string `yaml:"timeout"`
+	// Cooldown parks a target after a fallbackable failure (rate limit, auth
+	// loss, 5xx, timeout) so subsequent requests prefer another model instead
+	// of retrying an exhausted one first. Unset disables cooling.
+	Cooldown string `yaml:"cooldown"`
 }
 
 // TimeoutDuration returns the per-attempt timeout, or 0 when no timeout is set.
@@ -112,6 +116,18 @@ func (t TargetConfig) TimeoutDuration() time.Duration {
 		return 0
 	}
 	duration, err := time.ParseDuration(t.Timeout)
+	if err != nil || duration <= 0 {
+		return 0
+	}
+	return duration
+}
+
+// CooldownDuration returns the per-target cooldown, or 0 when unset.
+func (t TargetConfig) CooldownDuration() time.Duration {
+	if strings.TrimSpace(t.Cooldown) == "" {
+		return 0
+	}
+	duration, err := time.ParseDuration(t.Cooldown)
 	if err != nil || duration <= 0 {
 		return 0
 	}
@@ -259,6 +275,12 @@ func (c *Config) Validate() error {
 				duration, err := time.ParseDuration(target.Timeout)
 				if err != nil || duration <= 0 {
 					return fmt.Errorf("profile %q target %d has invalid timeout %q: must be a positive Go duration", name, i+1, target.Timeout)
+				}
+			}
+			if strings.TrimSpace(target.Cooldown) != "" {
+				duration, err := time.ParseDuration(target.Cooldown)
+				if err != nil || duration <= 0 {
+					return fmt.Errorf("profile %q target %d has invalid cooldown %q: must be a positive Go duration", name, i+1, target.Cooldown)
 				}
 			}
 			key := target.Backend + "\x00" + target.Model

@@ -112,16 +112,22 @@ func (s *Server) handleModels(w http.ResponseWriter, _ *http.Request) {
 func (s *Server) handleStatus(w http.ResponseWriter, _ *http.Request) {
 	state := s.state.Load()
 	backendStates := state.health.Snapshot()
+	targetStates := state.health.SnapshotTargets()
 	profileStatus := make(map[string][]map[string]any, len(state.config.Profiles))
 	for profile, definition := range state.config.Profiles {
 		for _, target := range definition.Targets {
-			backendState := backendStates[target.Backend]
-			profileStatus[profile] = append(profileStatus[profile], map[string]any{
+			targetState := targetStates[health.Key(target.Backend, target.Model)]
+			entry := map[string]any{
 				"level":    strings.TrimSpace(definition.Level),
 				"priority": definition.Priority, "retries": definition.EffectiveRetries(),
-				"backend": target.Backend, "model": target.Model, "healthy": backendState.Healthy,
-				"last_check": backendState.LastCheck, "last_error": backendState.LastError,
-			})
+				"backend": target.Backend, "model": target.Model,
+				"healthy": targetState.Healthy, "failures": targetState.Failures,
+				"last_check": targetState.LastCheck, "last_error": targetState.LastError,
+			}
+			if !targetState.CoolingUntil.IsZero() {
+				entry["cooling_until"] = targetState.CoolingUntil
+			}
+			profileStatus[profile] = append(profileStatus[profile], entry)
 		}
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
@@ -203,7 +209,7 @@ func (s *Server) serveRequest(w http.ResponseWriter, r *http.Request, req *respo
 		writeError(w, http.StatusServiceUnavailable, "profile has no available targets", requestID)
 		return
 	}
-	targets = preferHealthy(state.health.Snapshot(), targets)
+	targets = preferHealthy(state.health.SnapshotTargets(), targets)
 	var lastErr error
 	timedOut := false
 	rounds, backoff := attemptRounds(targets)
@@ -228,7 +234,7 @@ func (s *Server) serveRequest(w http.ResponseWriter, r *http.Request, req *respo
 				cancelAttempt()
 				timedOut = timedOut || attemptDeadlineHit
 				lastErr = callErr
-				s.recordHealth(r.Context(), state.health, target.Backend, callErr)
+				s.recordTargetHealth(r.Context(), state.health, target, callErr, true)
 				s.logAttempt(requestID, profile, target, started, time.Time{}, 0, index > 0, round, callErr)
 				if moreAttempts {
 					continue
@@ -241,7 +247,7 @@ func (s *Server) serveRequest(w http.ResponseWriter, r *http.Request, req *respo
 				cancelAttempt()
 				status, upstreamErr := upstreamError(resp)
 				lastErr = upstreamErr
-				s.recordHealth(r.Context(), state.health, target.Backend, upstreamErr)
+				s.recordTargetHealth(r.Context(), state.health, target, upstreamErr, shouldFallback(status))
 				s.logAttempt(requestID, profile, target, started, time.Time{}, status, index > 0, round, upstreamErr)
 				if moreAttempts {
 					continue
@@ -256,14 +262,14 @@ func (s *Server) serveRequest(w http.ResponseWriter, r *http.Request, req *respo
 					if wrapErr != nil {
 						_ = resp.Body.Close()
 						cancelAttempt()
-						s.recordHealth(r.Context(), state.health, target.Backend, wrapErr)
+						s.recordTargetHealth(r.Context(), state.health, target, wrapErr, true)
 						s.logAttempt(requestID, profile, target, started, time.Now(), resp.StatusCode, index > 0, round, wrapErr)
 						writeError(w, http.StatusBadGateway, wrapErr.Error(), requestID)
 						return
 					}
 					resp = converted
 				}
-				s.recordHealth(r.Context(), state.health, target.Backend, nil)
+				s.recordTargetHealth(r.Context(), state.health, target, nil, false)
 				defer resp.Body.Close()
 				copyHeaders(w.Header(), resp.Header)
 				w.WriteHeader(resp.StatusCode)
@@ -278,17 +284,17 @@ func (s *Server) serveRequest(w http.ResponseWriter, r *http.Request, req *respo
 					_ = resp.Body.Close()
 					stopTimeoutTimer(timer)
 					cancelAttempt()
-					s.recordHealth(r.Context(), state.health, target.Backend, wrapErr)
+					s.recordTargetHealth(r.Context(), state.health, target, wrapErr, true)
 					s.logAttempt(requestID, profile, target, started, time.Time{}, resp.StatusCode, index > 0, round, wrapErr)
 					writeError(w, http.StatusBadGateway, wrapErr.Error(), requestID)
 					return
 				}
 				resp = converted
 			}
-			streamResult := s.streamResponse(w, r, resp, requestID, profile, target, started, index > 0, round, func() { stopTimeoutTimer(timer) })
+			streamResult := s.streamResponse(w, r, resp, requestID, profile, target, started, index > 0, round, func() { stopTimeoutTimer(timer) }, wrap == nil)
 			stopTimeoutTimer(timer)
 			cancelAttempt()
-			s.recordHealth(r.Context(), state.health, target.Backend, streamResult.err)
+			s.recordTargetHealth(r.Context(), state.health, target, streamResult.err, streamResult.err != nil)
 			if streamResult.err != nil && !streamResult.wrote {
 				timedOut = timedOut || attemptTimedOut(attemptCtx, r.Context(), target.Timeout)
 				lastErr = streamResult.err
@@ -304,14 +310,24 @@ func (s *Server) serveRequest(w http.ResponseWriter, r *http.Request, req *respo
 	}
 }
 
-// preferHealthy moves targets whose backend has fewer consecutive failures
-// first, so an unstable provider is tried last instead of first. YAML order is
-// preserved inside a group of equal failure counts, and no target is dropped:
-// a failing backend still serves the request if every healthier one fails.
-func preferHealthy(backends map[string]health.Backend, targets []routing.Target) []routing.Target {
+// preferHealthy moves targets that are cooling down or have more consecutive
+// failures last, so an exhausted account or model is tried after a healthier
+// one. Ordering is per backend/model, so one broken model (for example an
+// invalidated account) does not demote every other model on the same backend.
+// YAML order is preserved inside a group of equal states, and no target is
+// dropped: a cooling or failing target still serves the request if every
+// healthier one fails.
+func preferHealthy(targetStates map[string]health.TargetState, targets []routing.Target) []routing.Target {
 	ordered := append([]routing.Target(nil), targets...)
+	now := time.Now()
 	sort.SliceStable(ordered, func(i, j int) bool {
-		return backends[ordered[i].Backend].Failures < backends[ordered[j].Backend].Failures
+		left := targetStates[health.Key(ordered[i].Backend, ordered[i].Model)]
+		right := targetStates[health.Key(ordered[j].Backend, ordered[j].Model)]
+		leftCooling, rightCooling := left.Cooling(now), right.Cooling(now)
+		if leftCooling != rightCooling {
+			return !leftCooling
+		}
+		return left.Failures < right.Failures
 	})
 	return ordered
 }
@@ -375,7 +391,11 @@ type streamResult struct {
 	err   error
 }
 
-func (s *Server) streamResponse(w http.ResponseWriter, r *http.Request, resp *http.Response, requestID, profile string, target routing.Target, started time.Time, fallback bool, round int, stopTimeout func()) streamResult {
+// maxBufferedStreamBytes bounds how much pre-output SSE data the gateway holds
+// while it can still transparently fall back to another target.
+const maxBufferedStreamBytes = 4 << 20
+
+func (s *Server) streamResponse(w http.ResponseWriter, r *http.Request, resp *http.Response, requestID, profile string, target routing.Target, started time.Time, fallback bool, round int, stopTimeout func(), sanitizeError bool) streamResult {
 	defer resp.Body.Close()
 	flusher, ok := w.(http.Flusher)
 	if !ok {
@@ -383,60 +403,217 @@ func (s *Server) streamResponse(w http.ResponseWriter, r *http.Request, resp *ht
 	}
 	parser := sse.NewParser(resp.Body)
 	firstToken := time.Time{}
-	wrote := false
-	writeEvent := func(raw []byte) {
-		if !wrote {
-			w.Header().Set("Content-Type", "text/event-stream")
-			w.Header().Set("Cache-Control", "no-cache")
-			w.Header().Set("Connection", "keep-alive")
-			w.Header().Set("X-Request-ID", requestID)
-			wrote = true
-		}
+	committed := false
+	terminal := false
+	var pending [][]byte
+	pendingBytes := 0
+
+	write := func(raw []byte) {
 		_, _ = w.Write(raw)
 		flusher.Flush()
 	}
+	commit := func() {
+		if committed {
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Cache-Control", "no-cache")
+		w.Header().Set("Connection", "keep-alive")
+		w.Header().Set("X-Request-ID", requestID)
+		committed = true
+		for _, raw := range pending {
+			write(raw)
+		}
+		pending = nil
+		pendingBytes = 0
+	}
+	// enqueue holds events back until the first answer output, so an upstream
+	// that returns HTTP 200 and then injects a failure can still be replaced by
+	// another target without the client ever seeing the aborted attempt.
+	enqueue := func(raw []byte) {
+		if committed {
+			write(raw)
+			return
+		}
+		pending = append(pending, raw)
+		pendingBytes += len(raw)
+		if pendingBytes >= maxBufferedStreamBytes {
+			commit()
+		}
+	}
+
 	for {
 		event, err := parser.Next()
-		if errors.Is(err, sse.ErrDone) {
+		switch {
+		case errors.Is(err, sse.ErrDone):
 			if len(event.Raw) > 0 {
-				writeEvent(event.Raw)
+				enqueue(event.Raw)
 			}
+			commit()
 			s.logAttempt(requestID, profile, target, started, firstToken, resp.StatusCode, fallback, round, nil)
-			return streamResult{wrote: wrote}
-		}
-		if errors.Is(err, io.EOF) && wrote {
-			s.logAttempt(requestID, profile, target, started, firstToken, resp.StatusCode, fallback, round, nil)
-			return streamResult{wrote: wrote}
-		}
-		if errors.Is(err, context.Canceled) || errors.Is(err, io.EOF) {
+			return streamResult{wrote: committed}
+		case errors.Is(err, io.EOF):
+			if terminal || committed {
+				commit()
+				s.logAttempt(requestID, profile, target, started, firstToken, resp.StatusCode, fallback, round, nil)
+				return streamResult{wrote: committed}
+			}
+			// The stream ended without a terminal event and nothing reached the
+			// client: safe to try another target.
 			s.logAttempt(requestID, profile, target, started, firstToken, resp.StatusCode, fallback, round, err)
-			return streamResult{wrote: wrote, err: err}
-		}
-		if err != nil {
+			return streamResult{err: err}
+		case err != nil:
 			s.logAttempt(requestID, profile, target, started, firstToken, resp.StatusCode, fallback, round, err)
-			return streamResult{wrote: wrote, err: err}
+			return streamResult{wrote: committed, err: err}
 		}
-		if firstToken.IsZero() {
-			if meaningfulEvent(event.Type, event.Data) {
-				firstToken = time.Now()
-				stopTimeout()
+
+		if message, isError := upstreamStreamError(event); isError {
+			streamErr := errors.New(message)
+			s.logAttempt(requestID, profile, target, started, firstToken, resp.StatusCode, fallback, round, streamErr)
+			if committed {
+				// Output already reached the client, so the partial response cannot
+				// be replayed against another model. Forward the terminal event, but
+				// strip the error object that clients report as an injected JSON
+				// error on the Responses wire format.
+				if sanitizeError {
+					write(stripErrorEvent(event))
+				} else {
+					write(event.Raw)
+				}
+				return streamResult{wrote: true, err: streamErr}
+			}
+			// Nothing reached the client: discard the buffered lifecycle events
+			// and let the gateway try the next target.
+			return streamResult{err: streamErr}
+		}
+
+		eventType := event.Type
+		if eventType == "" {
+			var envelope struct {
+				Type string `json:"type"`
+			}
+			if json.Unmarshal([]byte(event.Data), &envelope) == nil {
+				eventType = envelope.Type
 			}
 		}
-		writeEvent(event.Raw)
+		if eventType == "response.completed" || eventType == "response.incomplete" {
+			terminal = true
+		}
+		if firstToken.IsZero() && progressEvent(eventType) {
+			// Any delta proves the upstream is generating, so a per-target
+			// timeout must not cut a slow reasoning phase.
+			stopTimeout()
+		}
+		if firstToken.IsZero() && meaningfulEvent(eventType, event.Data) {
+			firstToken = time.Now()
+			stopTimeout()
+			commit()
+		}
+		enqueue(event.Raw)
 		select {
 		case <-r.Context().Done():
 			s.logAttempt(requestID, profile, target, started, firstToken, resp.StatusCode, fallback, round, r.Context().Err())
-			return streamResult{wrote: wrote, err: r.Context().Err()}
+			return streamResult{wrote: committed, err: r.Context().Err()}
 		default:
 		}
 	}
 }
 
-func (s *Server) recordHealth(ctx context.Context, registry *health.Registry, backend string, err error) {
+// upstreamStreamError reports whether an upstream SSE event carries a provider
+// failure. OpenRouter emits "response.failed" with response.error.message when
+// the backing provider fails after HTTP 200; other backends may emit a bare
+// "error" object. Clients treat such payloads as an injected JSON error, so the
+// gateway must never forward one from an attempt it could still replace.
+func upstreamStreamError(event sse.Event) (string, bool) {
+	if strings.TrimSpace(event.Data) == "" {
+		return "", false
+	}
+	var envelope struct {
+		Type    string `json:"type"`
+		Message string `json:"message"`
+		Error   *struct {
+			Message string `json:"message"`
+		} `json:"error"`
+		Response *struct {
+			Error *struct {
+				Message string `json:"message"`
+			} `json:"error"`
+		} `json:"response"`
+	}
+	if json.Unmarshal([]byte(event.Data), &envelope) != nil {
+		return "", false
+	}
+	eventType := event.Type
+	if eventType == "" {
+		eventType = envelope.Type
+	}
+	switch eventType {
+	case "response.failed":
+		if envelope.Response != nil && envelope.Response.Error != nil && envelope.Response.Error.Message != "" {
+			return envelope.Response.Error.Message, true
+		}
+		return "upstream response failed", true
+	case "error":
+		if envelope.Error != nil && envelope.Error.Message != "" {
+			return envelope.Error.Message, true
+		}
+		if envelope.Message != "" {
+			return envelope.Message, true
+		}
+		return "upstream error", true
+	}
+	// Defensive: a provider may inject a bare error object with no event type.
+	if eventType == "" && envelope.Error != nil && envelope.Error.Message != "" {
+		return envelope.Error.Message, true
+	}
+	return "", false
+}
+
+// progressEvent reports whether an event proves the upstream is still
+// generating, so a per-target timeout does not cancel a slow reasoning phase.
+func progressEvent(eventType string) bool {
+	return strings.Contains(eventType, "delta") || eventType == "response.completed"
+}
+
+// stripErrorEvent removes error details from a terminal event so clients that
+// reject any SSE payload containing an error object still see a clean failure.
+func stripErrorEvent(event sse.Event) []byte {
+	var envelope map[string]json.RawMessage
+	if json.Unmarshal([]byte(event.Data), &envelope) != nil {
+		return event.Raw
+	}
+	delete(envelope, "error")
+	delete(envelope, "error_type")
+	if raw, ok := envelope["response"]; ok {
+		var response map[string]json.RawMessage
+		if json.Unmarshal(raw, &response) == nil {
+			delete(response, "error")
+			delete(response, "error_type")
+			if encoded, err := json.Marshal(response); err == nil {
+				envelope["response"] = encoded
+			}
+		}
+	}
+	encoded, err := json.Marshal(envelope)
+	if err != nil {
+		return event.Raw
+	}
+	return append(append([]byte("data: "), encoded...), '\n', '\n')
+}
+
+// recordTargetHealth records one backend/model attempt. Backend health is kept
+// for the /status summary, while routing orders by the per-target state so a
+// single failing model cannot demote healthy models that share its backend.
+func (s *Server) recordTargetHealth(ctx context.Context, registry *health.Registry, target routing.Target, err error, fallbackable bool) {
 	if err != nil && ctx.Err() != nil {
 		return
 	}
-	registry.Set(backend, err)
+	cooldown := time.Duration(0)
+	if err != nil && fallbackable {
+		cooldown = target.Cooldown
+	}
+	registry.SetTarget(target.Backend, target.Model, err, cooldown)
+	registry.Set(target.Backend, err)
 }
 
 func meaningfulEvent(eventType, data string) bool {

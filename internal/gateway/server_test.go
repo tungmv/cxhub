@@ -288,27 +288,120 @@ func TestFallbackWhenStreamEndsBeforeFirstEvent(t *testing.T) {
 	}
 }
 
-func TestPreferHealthyOrdersFailingBackendLast(t *testing.T) {
+// TestFallbackWhenStreamInjectsFailure reproduces a provider that returns HTTP
+// 200, emits the response lifecycle, then injects a response.failed error into
+// the SSE stream. The gateway must discard the aborted attempt and serve the
+// request from the next target instead of leaking the error to the client.
+func TestFallbackWhenStreamInjectsFailure(t *testing.T) {
+	first := &fakeUpstream{events: []string{
+		event("response.created", `{"type":"response.created","response":{"id":"resp_1"}}`),
+		event("response.in_progress", `{"type":"response.in_progress","response":{"id":"resp_1"}}`),
+		event("response.failed", `{"type":"response.failed","response":{"id":"resp_1","status":"failed","output":[],"error":{"code":"server_error","message":"Upstream error from Nvidia: Service temporarily overloaded"},"error_type":"provider_overloaded"}}`),
+		"data: [DONE]\n\n",
+	}}
+	second := &fakeUpstream{events: []string{
+		event("response.created", `{"type":"response.created","response":{"id":"resp_2"}}`),
+		event("response.output_text.delta", `{"delta":"recovered"}`),
+		"data: [DONE]\n\n",
+	}}
+	server, _ := newTestGateway(t, map[string]*fakeUpstream{"first": first, "second": second}, map[string]config.ProfileConfig{"fallback": {Targets: []config.TargetConfig{{Backend: "first", Model: "one"}, {Backend: "second", Model: "two"}}}})
+	response, err := server.Client().Post(server.URL+"/v1/responses", "application/json", strings.NewReader(`{"model":"fallback","stream":true}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	body, _ := io.ReadAll(response.Body)
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, body=%s", response.StatusCode, body)
+	}
+	if !strings.Contains(string(body), `"delta":"recovered"`) {
+		t.Fatalf("expected fallback to the next target, body=%s", body)
+	}
+	if strings.Contains(string(body), "response.failed") || strings.Contains(string(body), "temporarily overloaded") {
+		t.Fatalf("injected upstream failure leaked to the client: %s", body)
+	}
+}
+
+// TestStreamFailureAfterOutputStripsError covers the case where the provider
+// fails only after answer output has already been streamed and fallback is no
+// longer safe: the terminal event must not carry the error object that clients
+// report as an injected JSON error.
+func TestStreamFailureAfterOutputStripsError(t *testing.T) {
+	first := &fakeUpstream{events: []string{
+		event("response.created", `{"type":"response.created","response":{"id":"resp_1"}}`),
+		event("response.output_text.delta", `{"delta":"partial"}`),
+		event("response.failed", `{"type":"response.failed","response":{"id":"resp_1","status":"failed","output":[],"error":{"code":"server_error","message":"Upstream error from Nvidia: Service temporarily overloaded"},"error_type":"provider_overloaded"}}`),
+		"data: [DONE]\n\n",
+	}}
+	server, _ := newTestGateway(t, map[string]*fakeUpstream{"first": first}, map[string]config.ProfileConfig{"solo": {Targets: []config.TargetConfig{{Backend: "first", Model: "one"}}}})
+	response, err := server.Client().Post(server.URL+"/v1/responses", "application/json", strings.NewReader(`{"model":"solo","stream":true}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	body, _ := io.ReadAll(response.Body)
+	if !strings.Contains(string(body), `"delta":"partial"`) {
+		t.Fatalf("expected committed output, body=%s", body)
+	}
+	if strings.Contains(string(body), `"error":{`) || strings.Contains(string(body), "temporarily overloaded") {
+		t.Fatalf("error object leaked into the client stream: %s", body)
+	}
+}
+
+func TestPreferHealthyOrdersFailingTargetLast(t *testing.T) {
 	targets := []routing.Target{
 		{Backend: "flaky", Model: "a"},
 		{Backend: "steady", Model: "b"},
 		{Backend: "dead", Model: "c"},
 	}
-	backends := map[string]health.Backend{
-		"flaky":  {Failures: 1},
-		"steady": {Failures: 0},
-		"dead":   {Failures: 7},
+	targetStates := map[string]health.TargetState{
+		health.Key("flaky", "a"):  {Failures: 1},
+		health.Key("steady", "b"): {Failures: 0},
+		health.Key("dead", "c"):   {Failures: 7},
 	}
 	order := []string{}
-	for _, target := range preferHealthy(backends, targets) {
-		order = append(order, target.Backend)
+	for _, target := range preferHealthy(targetStates, targets) {
+		order = append(order, target.Model)
 	}
-	if strings.Join(order, ",") != "steady,flaky,dead" {
+	if strings.Join(order, ",") != "b,a,c" {
 		t.Fatalf("expected healthy-first ordering, got %v", order)
 	}
-	// A failing backend must stay reachable, never be dropped.
-	if len(preferHealthy(backends, targets)) != len(targets) {
+	// A failing target must stay reachable, never be dropped.
+	if len(preferHealthy(targetStates, targets)) != len(targets) {
 		t.Fatal("preferHealthy dropped a target")
+	}
+}
+
+// TestPreferHealthyIsPerTarget guards the regression where one broken model on a
+// shared backend demoted every other model on that backend.
+func TestPreferHealthyIsPerTarget(t *testing.T) {
+	targets := []routing.Target{
+		{Backend: "cliproxy", Model: "codex-broken"},
+		{Backend: "cliproxy", Model: "gemini-ok"},
+		{Backend: "openrouter", Model: "or-ok"},
+	}
+	targetStates := map[string]health.TargetState{
+		health.Key("cliproxy", "codex-broken"): {Failures: 40},
+	}
+	order := []string{}
+	for _, target := range preferHealthy(targetStates, targets) {
+		order = append(order, target.Model)
+	}
+	if strings.Join(order, ",") != "gemini-ok,or-ok,codex-broken" {
+		t.Fatalf("healthy models on a shared backend must stay ahead, got %v", order)
+	}
+}
+
+func TestPreferHealthyOrdersCoolingTargetLast(t *testing.T) {
+	targets := []routing.Target{
+		{Backend: "a", Model: "hot"},
+		{Backend: "b", Model: "cooled"},
+	}
+	targetStates := map[string]health.TargetState{
+		health.Key("b", "cooled"): {Failures: 0, CoolingUntil: time.Now().Add(time.Minute)},
+	}
+	if got := preferHealthy(targetStates, targets)[0].Model; got != "hot" {
+		t.Fatalf("a cooling target must be tried last, got first %q", got)
 	}
 }
 

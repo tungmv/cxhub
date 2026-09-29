@@ -56,6 +56,13 @@ profiles:
       - backend: openrouter
         model: YOUR_MODEL
         timeout: 45s
+        # `cooldown` parks this backend/model after a fallbackable failure
+        # (rate limit, auth loss, 5xx, timeout) so later requests try a
+        # healthier target first instead of an exhausted account. The target is
+        # deprioritized, not removed, so it is still used if everything else
+        # fails. Ordering is per backend/model: one broken model never demotes
+        # other models on the same backend.
+        cooldown: 2m
   reviewer:
     level: reasoning
     priority: 10
@@ -77,8 +84,21 @@ decision:
   backend: openrouter
   model: respan/span-01-lite
   default_profile: orchestrator
-  candidates: [fast, orchestrator, reviewer]
+  candidates: [fast, orchestrator, reviewer, auto]
   timeout: 2s
 
 logging:
   verbose: false
+
+profiles:
+  auto:
+    level: reasoning
+    priority: 0
+    retries: 3
+    retry_backoff: 2s
+    targets:
+      - backend: cliproxy
+        model: "claude-opus-4-6-thinking"
+      - backend: openrouter
+        model: "stealth/space-bunny-alpha"
+

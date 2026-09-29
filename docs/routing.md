@@ -125,6 +125,33 @@ profiles:
         timeout: 45s
 ```
 
+## Per-target cooldown
+
+Each target accepts an optional `cooldown` (a Go duration, for example `2m`).
+After a fallbackable failure — connection error, per-target timeout, or upstream
+`408`, `429`, `500`, `502`, `503`, `504` — the backend/model pair is parked for
+the cooldown window. While parked it is ordered after every non-cooling target,
+so a rate-limited or invalidated account is not retried first. A successful
+attempt clears the cooldown.
+
+Tracked state is per backend/model, so one broken model (for example an
+expired OAuth token for a single provider family) never demotes the other models
+served by the same backend. A cooling target is never dropped: if every
+healthier target fails, the gateway still attempts it.
+
+```yaml
+profiles:
+  coder:
+    targets:
+      - backend: cliproxy
+        model: gpt-5.5
+        cooldown: 5m
+      - backend: cliproxy
+        model: gemini-3.7-flash-high
+```
+
+`GET /status` exposes `failures`, `last_error`, and `cooling_until` per target.
+
 ## Per-target timeout
 
 Each target accepts an optional `timeout` (a Go duration, for example `45s`).
@@ -137,10 +164,19 @@ attempt list has timed out, the gateway replies with HTTP `504`.
 
 Fallback is deterministic and request-local. Connection failures, per-target
 timeouts, and upstream `408`, `429`, `500`, `502`, `503`, and `504` responses may
-advance to the next target before a response has produced meaningful output. A
-successful streamed response is never replayed to another model. Once an event
-has been written, the gateway cannot safely cross-model replay a partially
-observed response or a tool interaction.
+advance to the next target before a response has produced meaningful output.
+
+A provider may also return HTTP `200` and then inject a failure event
+(`response.failed`, or a bare `error` object) into the SSE stream — for example
+when the backing provider behind OpenRouter is overloaded. The gateway buffers
+the response lifecycle events until the first answer output, so a failure that
+arrives before any answer can still be replaced by the next target and the
+client never sees the aborted attempt. If the failure arrives after answer
+output has already streamed, the gateway forwards a terminal event with the
+error object removed; clients report a raw error payload as an injected JSON
+error. A successful streamed response is never replayed to another model: once
+answer output has been written, the gateway cannot safely cross-model replay a
+partially observed response or a tool interaction.
 
 The MVP forwards upstream SSE records rather than interpreting model semantics. It
 therefore preserves function-call names, IDs, argument deltas, tool outputs, and

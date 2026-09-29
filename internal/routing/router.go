@@ -18,6 +18,7 @@ type Target struct {
 	Backend  string
 	Model    string
 	Timeout  time.Duration
+	Cooldown time.Duration
 	Retries  int
 	Backoff  time.Duration
 	Provider provider.Provider
@@ -49,6 +50,7 @@ func New(cfg *config.Config, providers map[string]provider.Provider) *Router {
 				Backend:  target.Backend,
 				Model:    target.Model,
 				Timeout:  target.TimeoutDuration(),
+				Cooldown: target.CooldownDuration(),
 				Retries:  profile.EffectiveRetries(),
 				Backoff:  profile.RetryBackoffDuration(),
 				Provider: providers[target.Backend],
